@@ -44,6 +44,9 @@ resolve_path = $(if $(filter /%,$(1)),$(1),$(abspath $(MAKEFILE_DIR)/$(1)))
 RESOLVED_ENV_FILE := $(call resolve_path,$(ENV_FILE))
 RESOLVED_COMPOSE_FILE := $(call resolve_path,$(COMPOSE_FILE))
 
+#exporting this variable so compose file uses this variable for env configuration
+SERVICE_ENV_FILE ?= $(RESOLVED_ENV_FILE)
+export SERVICE_ENV_FILE
 # -----------------------------------------------------------------------------
 # Docker Compose configuration
 # -----------------------------------------------------------------------------

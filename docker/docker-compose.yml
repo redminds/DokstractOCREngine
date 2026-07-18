@@ -4,7 +4,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
     env_file:
-      - .env
+      - ${SERVICE_ENV_FILE}
     environment:
       OCR_ENGINE_OCR_API_TOKEN: ${OCR_ENGINE_OCR_API_TOKEN:?OCR_ENGINE_OCR_API_TOKEN is required}
       OCR_ENGINE_SCHEMA_API_TOKEN: ${OCR_ENGINE_SCHEMA_API_TOKEN:?OCR_ENGINE_SCHEMA_API_TOKEN is required}
