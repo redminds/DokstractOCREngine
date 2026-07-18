@@ -37,6 +37,6 @@ make up
 
 ## Notes
 
-- Internal routes use `X-Engine-Internal-Token`.
+- Internal routes use `X-Service-Name` and `X-Service-Token` for service auth, and `X-Engine-Admin-Token` for admin routes.
 - Admin routes use `X-Engine-Admin-Token`.
 - The registry records manual intervention requests, audit events, and release history.

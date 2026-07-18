@@ -1,133 +1,101 @@
-#!/usr/bin/env bash
-set -Eeuo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DOCKER_DIR="$REPO_ROOT/docker"
-ENV_FILE="$DOCKER_DIR/.env"
-COMPOSE_FILE="$DOCKER_DIR/docker-compose.yml"
-COMPOSE_PROJECT_NAME="dokstract-ocr-engine"
-COMPOSE_SERVICE="ocr-engine"
-WAIT_TIMEOUT_SECONDS="${WAIT_TIMEOUT_SECONDS:-180}"
-WAIT_INTERVAL_SECONDS="${WAIT_INTERVAL_SECONDS:-5}"
+#!/bin/sh
+set -eu
+
+APP_NAME="DokstractOCREngine"
+
+# Jenkins GitHub checkout directory.
+SOURCE_ROOT="$(pwd)"
+
+# Stable application and configuration locations.
+DEPLOY_ROOT="/opt/dokstract/dev/$APP_NAME"
+CONFIG_ROOT="/etc/dokstract/dev/$APP_NAME"
+ENV_FILE="$CONFIG_ROOT/.env"
 
 fail() {
-  printf '%s\n' "ERROR: $*" >&2
+  echo "ERROR: $*" >&2
   exit 1
 }
 
 log() {
-  printf '%s\n' "[jenkins] $*"
+  echo "[deploy] $*"
 }
 
-require_command() {
-  command -v "$1" >/dev/null 2>&1 || fail "Missing required command: $1"
-}
+log "Source Root Path: $SOURCE_ROOT"
 
-require_file() {
-  [[ -f "$1" ]] || fail "Missing required file: $1"
-}
 
-require_env() {
-  local name="$1"
-  [[ -n "${!name:-}" ]] || fail "Missing required environment variable: $name"
-}
+[ -d "$SOURCE_ROOT" ] \
+  || fail "Jenkins source directory not found: $SOURCE_ROOT"
 
-diagnose_failure() {
-  local exit_code="$1"
-  local line_no="$2"
+[ "$SOURCE_ROOT" != "$DEPLOY_ROOT" ] \
+  || fail "Source and deployment directories must be different: $SOURCE_ROOT"
 
-  trap - ERR
-  printf '%s\n' "[jenkins] deployment failed at line ${line_no} (exit ${exit_code})." >&2
-  if command -v docker >/dev/null 2>&1; then
-    printf '%s\n' '[jenkins] docker compose ps:' >&2
-    docker compose --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE" ps >&2 || true
-    local container_id
-    container_id="$(docker compose --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE" ps -q "$COMPOSE_SERVICE" 2>/dev/null || true)"
-    if [[ -n "$container_id" ]]; then
-      printf '%s\n' '[jenkins] container health:' >&2
-      docker inspect -f 'name={{.Name}} status={{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_id" >&2 || true
-    fi
-    printf '%s\n' '[jenkins] recent service logs:' >&2
-    docker compose --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE" logs --tail 100 "$COMPOSE_SERVICE" >&2 || true
-  fi
-  exit "$exit_code"
-}
+[ -d "$CONFIG_ROOT" ] \
+  || fail "Configuration directory not found: $CONFIG_ROOT"
 
-trap 'diagnose_failure $? $LINENO' ERR
+[ -f "$ENV_FILE" ] \
+  || fail "Runtime environment file not found: $ENV_FILE"
 
-log "Resolving engine deployment paths"
-log "Repo root: $REPO_ROOT"
-log "Env file: $ENV_FILE"
-log "Compose file: $COMPOSE_FILE"
-
-require_command docker
-require_file "$ENV_FILE"
-require_file "$COMPOSE_FILE"
-require_file "$REPO_ROOT/Makefile"
-require_file "$DOCKER_DIR/Makefile"
-require_file "$DOCKER_DIR/Dockerfile"
-[[ -d "$REPO_ROOT/app" ]] || fail "Missing required directory: $REPO_ROOT/app"
-
-set -a
-source "$ENV_FILE"
-set +a
-
-for name in \
-  APP_ENV \
-  ENGINE_SERVICE_NAME \
-  ENGINE_HOST \
-  ENGINE_PORT \
-  ENGINE_HOST_PORT \
-  ENGINE_INTERNAL_TOKEN \
-  ENGINE_ADMIN_TOKEN \
-  ENGINE_REGISTRY_DB_PATH \
-  ENGINE_DEFAULT_RELEASE_TAG \
-  ENGINE_DEFAULT_IMAGE_DIGEST \
-  ENGINE_DEFAULT_SUPPORTED_API_VERSIONS \
-  ENGINE_DEFAULT_CAPABILITIES \
-  ENGINE_CORS_ORIGINS \
-  OCR_LANG \
-  OCR_CPU_THREADS \
-  OCR_DET_LIMIT_SIDE_LEN \
-  OCR_TEXT_BATCH_SIZE \
-  ENGINE_MAX_INFLIGHT_REQUESTS
-do
-  require_env "$name"
+for command_name in rsync docker make; do
+  command -v "$command_name" >/dev/null 2>&1 \
+    || fail "Required command not found: $command_name"
 done
 
-log "Validating compose configuration"
-docker compose --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE" config >/dev/null
+docker compose version >/dev/null 2>&1 \
+  || fail "Docker Compose v2 is required"
 
-log "Building OCR Engine image"
-docker compose --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE" build "$COMPOSE_SERVICE"
+required_source_files="
+docker/Makefile
+docker/Dockerfile
+docker/docker-compose.yml
+app/main.py
+app/core/config.py
+"
 
-log "Deploying OCR Engine service"
-docker compose --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE" up -d --remove-orphans --no-build "$COMPOSE_SERVICE"
-
-log "Waiting for OCR Engine health"
-deadline=$(( $(date +%s) + WAIT_TIMEOUT_SECONDS ))
-while :; do
-  container_id="$(docker compose --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE" ps -q "$COMPOSE_SERVICE")"
-  [[ -n "$container_id" ]] || fail "OCR Engine container is not running."
-
-  health_status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container_id" 2>/dev/null || true)"
-  if [[ "$health_status" == "healthy" ]]; then
-    break
-  fi
-
-  if [[ "$health_status" == "unhealthy" ]]; then
-    fail "OCR Engine container reported unhealthy."
-  fi
-
-  if [[ $(date +%s) -ge "$deadline" ]]; then
-    fail "Timed out waiting for OCR Engine to become healthy."
-  fi
-
-  sleep "$WAIT_INTERVAL_SECONDS"
+for rel in $required_source_files; do
+  [ -f "$SOURCE_ROOT/$rel" ] \
+    || fail "Missing required source file: $SOURCE_ROOT/$rel"
 done
 
-log "Deployment status"
-docker compose --env-file "$ENV_FILE" -p "$COMPOSE_PROJECT_NAME" -f "$COMPOSE_FILE" ps
+mkdir -p "$DEPLOY_ROOT"
 
-log "Deployment completed successfully"
+log "Syncing $APP_NAME source"
+
+rsync -a --delete \
+  --exclude '.git/' \
+  --exclude '.gitignore' \
+  --exclude '.github/' \
+  --exclude '__pycache__/' \
+  --exclude '*.pyc' \
+  --exclude '*.pyo' \
+  --exclude '.env' \
+  --exclude '.env.*' \
+  --exclude 'docker/.env' \
+  --exclude 'docker/.env.*' \
+  --exclude '.venv/' \
+  --exclude '.jenkins-venv/' \
+  --exclude '.pytest_cache/' \
+  --exclude '.mypy_cache/' \
+  --exclude '.ruff_cache/' \
+  --exclude '.cache/' \
+  --exclude '.data/' \
+  --exclude 'logs/' \
+  --exclude 'tmp/' \
+  --exclude '*.bak' \
+  --exclude '*.bak.*' \
+  --exclude '*.old' \
+  --exclude '*~' \
+  "$SOURCE_ROOT/" "$DEPLOY_ROOT/"
+
+for rel in $required_source_files; do
+  [ -f "$DEPLOY_ROOT/$rel" ] \
+    || fail "Missing deployed file after sync: $DEPLOY_ROOT/$rel"
+done
+
+chmod 600 "$ENV_FILE"
+
+log "Deploying $APP_NAME"
+
+make -C "$DEPLOY_ROOT/docker" ENV_FILE="$ENV_FILE" deploy
+
+log "$APP_NAME deployment completed"
