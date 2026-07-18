@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from app.core.security import require_internal_token
+from app.core.security import authenticate_service
 from app.core.service import OCREngineService
 
 
-router = APIRouter(prefix="/api/v1/internal", tags=["internal"], dependencies=[Depends(require_internal_token)])
+router = APIRouter(prefix="/api/v1/internal", tags=["internal"])
 
 
 class DependencyRequest(BaseModel):
@@ -23,7 +23,7 @@ def get_engine_service() -> OCREngineService:
 
 
 @router.get("/releases/current")
-def current_release(service: OCREngineService = Depends(get_engine_service)):
+def current_release(_service_name: str = Depends(authenticate_service), service: OCREngineService = Depends(get_engine_service)):
     return service.snapshot().get("active_release")
 
 
@@ -31,8 +31,17 @@ def current_release(service: OCREngineService = Depends(get_engine_service)):
 def request_dependency(
     project_id: str,
     payload: DependencyRequest,
+    service_name: str = Depends(authenticate_service),
     service: OCREngineService = Depends(get_engine_service),
 ):
+    allowed_project = {"ocr-api": "ocr", "schema-api": "schema"}.get(service_name)
+    if allowed_project is None:
+        raise HTTPException(status_code=403, detail="Unknown service identity.")
+    if project_id.strip().lower() != allowed_project:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Service '{service_name}' is not permitted to request dependencies for project_id='{project_id}'.",
+        )
     outcome = service.request_dependency(
         project_id=project_id,
         capability=payload.capability,

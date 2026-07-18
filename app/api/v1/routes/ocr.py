@@ -4,17 +4,21 @@ import threading
 from contextlib import contextmanager
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
 
 from app.core.config import SETTINGS
 from app.core.ocr_execution import OCRDependencyUnavailable, extract_internal_ocr_document
-from app.core.security import require_internal_token
+from app.core.security import authenticate_service
 from app.core.service import OCREngineService
 
 
-router = APIRouter(prefix="/api/v1/internal/ocr", tags=["ocr"], dependencies=[Depends(require_internal_token)])
+router = APIRouter(prefix="/api/v1/internal/ocr", tags=["ocr"])
 _ENGINE_REQUEST_GATE = threading.BoundedSemaphore(max(1, SETTINGS.engine_max_inflight_requests))
-_AUTHORIZED_PROJECT_KEY = "schema"
+_AUTHORIZED_PROJECT_KEYS = {"ocr-api": "ocr", "schema-api": "schema"}
+_ROUTE_ALLOWLIST = {
+    "extract": {"ocr-api", "schema-api"},
+    "auto": {"schema-api"},
+}
 
 
 def get_engine_service() -> OCREngineService:
@@ -41,6 +45,7 @@ def _acquire_engine_request_slot():
 @router.post("/extract")
 @router.post("/auto")
 def extract_document(
+    request: Request,
     file: UploadFile = File(...),
     project_key: str = Form("schema"),
     api_version: str = Form("v1"),
@@ -50,15 +55,26 @@ def extract_document(
     x_request_id: str | None = Header(default=None, alias="X-Request-ID"),
     x_correlation_id: str | None = Header(default=None, alias="X-Correlation-ID"),
     x_job_id: str | None = Header(default=None, alias="X-Job-ID"),
+    service_name: str = Depends(authenticate_service),
     service: OCREngineService = Depends(get_engine_service),
 ) -> dict[str, Any]:
+    route_name = "auto" if request.url.path.endswith("/auto") else "extract"
+    allowed_services = _ROUTE_ALLOWLIST[route_name]
+    if service_name not in allowed_services:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Service '{service_name}' is not permitted to call this OCR route.",
+        )
     requested_capabilities = _parse_capabilities(capabilities, ("ocr", "pdf"))
     primary_capability = requested_capabilities[0] if requested_capabilities else "ocr"
     normalized_project_key = project_key.strip().lower()
-    if normalized_project_key != _AUTHORIZED_PROJECT_KEY:
+    expected_project_key = _AUTHORIZED_PROJECT_KEYS.get(service_name)
+    if expected_project_key is None:
+        raise HTTPException(status_code=403, detail=f"Service '{service_name}' is not permitted to access OCR routes.")
+    if normalized_project_key != expected_project_key:
         raise HTTPException(
             status_code=403,
-            detail=f"OCR engine internal OCR access is restricted to project_key='{_AUTHORIZED_PROJECT_KEY}'.",
+            detail=f"OCR engine internal OCR access is restricted to project_key='{expected_project_key}'.",
         )
     outcome = service.request_dependency(
         project_id=normalized_project_key,

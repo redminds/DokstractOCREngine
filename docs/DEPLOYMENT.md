@@ -83,7 +83,8 @@ make down
 | `ENGINE_HOST` | In-container bind host |
 | `ENGINE_PORT` | In-container API port |
 | `ENGINE_HOST_PORT` | Host-published port |
-| `ENGINE_INTERNAL_TOKEN` | Internal auth token |
+| `OCR_ENGINE_OCR_API_TOKEN` | OCR API caller token for OCR Engine routes |
+| `OCR_ENGINE_SCHEMA_API_TOKEN` | Schema API caller token for OCR Engine routes |
 | `ENGINE_ADMIN_TOKEN` | Admin auth token |
 | `ENGINE_CORS_ORIGINS` | Allowed browser origins |
 | `ENGINE_REGISTRY_DB_PATH` | Path to engine registry DB |
@@ -107,6 +108,7 @@ make down
 
 | Variable | dev | prod |
 |----------|-----|------|
-| `ENGINE_INTERNAL_TOKEN` | (per env) | **Strong secret** |
+| `OCR_ENGINE_OCR_API_TOKEN` | (per env) | **Strong secret** |
+| `OCR_ENGINE_SCHEMA_API_TOKEN` | (per env) | **Strong secret** |
 | `ENGINE_ADMIN_TOKEN` | (per env) | **Strong secret** |
 | `ENGINE_HOST_PORT` | 8010 | 8011 |

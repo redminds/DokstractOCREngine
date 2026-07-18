@@ -16,7 +16,8 @@ class EngineSettings:
     service_name: str = os.getenv("ENGINE_SERVICE_NAME", "dokstract-ocr-engine").strip()
     host: str = os.getenv("ENGINE_HOST", "0.0.0.0").strip()
     port: int = int(os.getenv("ENGINE_PORT", "8010"))
-    internal_token: str = os.getenv("ENGINE_INTERNAL_TOKEN", "change-me-internal").strip()
+    ocr_api_token: str = os.getenv("OCR_ENGINE_OCR_API_TOKEN", "change-me-ocr-api-to-engine").strip()
+    schema_api_token: str = os.getenv("OCR_ENGINE_SCHEMA_API_TOKEN", "change-me-schema-api-to-engine").strip()
     admin_token: str = os.getenv("ENGINE_ADMIN_TOKEN", "change-me-admin").strip()
     registry_db_path: str = os.getenv("ENGINE_REGISTRY_DB_PATH", "workspace_tmp/ocr-engine-registry.db").strip()
     default_release_tag: str = os.getenv("ENGINE_DEFAULT_RELEASE_TAG", "ocr-engine-2026.07.15").strip()
@@ -49,7 +50,9 @@ SETTINGS = EngineSettings()
 
 def validate_startup_configuration() -> None:
     if SETTINGS.app_env == "production":
-        if SETTINGS.internal_token in {"change-me-internal", "change-me", "changeme"}:
-            raise RuntimeError("ENGINE_INTERNAL_TOKEN must be configured in production.")
+        if SETTINGS.ocr_api_token in {"change-me-ocr-api-to-engine", "change-me", "changeme"}:
+            raise RuntimeError("OCR_ENGINE_OCR_API_TOKEN must be configured in production.")
+        if SETTINGS.schema_api_token in {"change-me-schema-api-to-engine", "change-me", "changeme"}:
+            raise RuntimeError("OCR_ENGINE_SCHEMA_API_TOKEN must be configured in production.")
         if SETTINGS.admin_token in {"change-me-admin", "change-me", "changeme"}:
             raise RuntimeError("ENGINE_ADMIN_TOKEN must be configured in production.")
