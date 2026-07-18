@@ -1,36 +1,30 @@
-.PHONY: help config build up down restart logs ps health test-deploy deploy test compile validate
+.PHONY: help config build up down restart logs ps health test-deploy deploy
 
 SHELL := /bin/bash
 .SHELLFLAGS := -Eeuo pipefail -c
 
-REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
-DOCKER_DIR := $(REPO_ROOT)/docker
+REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
 COMPOSE_FILE ?= docker-compose.yml
 ENV_FILE ?= .env
 COMPOSE_PROJECT_NAME ?= dokstract-ocr-engine
 COMPOSE_SERVICE ?= ocr-engine
-DOCKER_COMPOSE = docker compose --env-file "$(DOCKER_DIR)/$(ENV_FILE)" -p "$(COMPOSE_PROJECT_NAME)" -f "$(DOCKER_DIR)/$(COMPOSE_FILE)"
-PYTHON ?= py -3
-PYCACHE ?= /tmp/dokstract-ocr-engine-pycache
+DOCKER_COMPOSE = docker compose --env-file "$(REPO_ROOT)/$(ENV_FILE)" -p "$(COMPOSE_PROJECT_NAME)" -f "$(REPO_ROOT)/$(COMPOSE_FILE)"
 WAIT_TIMEOUT_SECONDS ?= 180
 WAIT_INTERVAL_SECONDS ?= 5
 
 help:
 	@printf '%s\n' \
 		'Available targets:' \
-		'  make config      - validate the compose file and env file' \
-		'  make build       - build the OCR Engine image' \
-		'  make up          - start the OCR Engine compose service' \
-		'  make down        - stop the OCR Engine compose service' \
-		'  make restart     - restart the OCR Engine compose service' \
-		'  make logs        - follow OCR Engine logs' \
-		'  make ps          - show OCR Engine status' \
-		'  make health      - wait for OCR Engine health' \
-		'  make deploy      - validate, build, deploy, and wait for health' \
-		'  make test-deploy - alias for deploy' \
-		'  make test        - run the unit test suite' \
-		'  make compile     - syntax-check the Python sources' \
-		'  make validate    - run compile and tests'
+		'  make -C docker config      - validate the compose file and env file' \
+		'  make -C docker build       - build the OCR Engine image' \
+		'  make -C docker up          - start the OCR Engine compose service' \
+		'  make -C docker down        - stop the OCR Engine compose service' \
+		'  make -C docker restart     - restart the OCR Engine compose service' \
+		'  make -C docker logs        - follow OCR Engine logs' \
+		'  make -C docker ps          - show OCR Engine status' \
+		'  make -C docker health      - wait for OCR Engine health' \
+		'  make -C docker deploy      - validate, build, deploy, and wait for health' \
+		'  make -C docker test-deploy - alias for deploy'
 
 config:
 	$(DOCKER_COMPOSE) config
@@ -90,19 +84,3 @@ deploy:
 	$(DOCKER_COMPOSE) up -d --remove-orphans --no-build $(COMPOSE_SERVICE)
 	$(MAKE) health
 	$(DOCKER_COMPOSE) ps
-
-test:
-	$(PYTHON) -m pytest
-
-compile:
-	PYTHONPYCACHEPREFIX=$(PYCACHE) $(PYTHON) -m py_compile \
-		app/main.py \
-		app/core/config.py \
-		app/core/registry.py \
-		app/core/service.py \
-		app/api/v1/routes/engine.py \
-		app/api/v1/routes/admin.py \
-		tests/test_registry.py \
-		tests/test_api.py
-
-validate: compile test

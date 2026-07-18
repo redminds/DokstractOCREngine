@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: dokstract-ocr-engine
+Version: 0.1.0
+Summary: Dokstract OCR Engine Service with versioned dependency registry
+Requires-Python: >=3.11
+Provides-Extra: test
+Requires-Dist: pytest>=8.0.0; extra == "test"
+Requires-Dist: httpx>=0.27.0; extra == "test"
