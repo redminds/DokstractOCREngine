@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,7 @@ _OCR_ENGINE = None
 def _get_ocr_engine():
     global _OCR_ENGINE
     if _OCR_ENGINE is None:
+        init_start = time.perf_counter()
         try:
             from paddleocr import PaddleOCR
         except Exception as exc:  # pragma: no cover - environment-specific
@@ -49,6 +51,9 @@ def _get_ocr_engine():
             )
         except Exception as exc:  # pragma: no cover - environment-specific
             raise OCRDependencyUnavailable(f"OCR engine unavailable: {exc}") from exc
+        init_elapsed = time.perf_counter() - init_start
+        logger.info("PaddleOCR model initialized in %.2fs (lang=%s cpu_threads=%d)",
+                     init_elapsed, SETTINGS.ocr_lang, SETTINGS.ocr_cpu_threads)
     return _OCR_ENGINE
 
 
@@ -310,8 +315,16 @@ def extract_internal_ocr_document(
 
                 for page_number in selection.page_numbers:
                     page = doc[page_number - 1]
+                    render_start = time.perf_counter()
                     image = pdf_page_to_img(page, 1.6 if enhance else 1.4)
+                    render_elapsed = time.perf_counter() - render_start
+                    ocr_start = time.perf_counter()
                     results_for_page, accuracy = _build_results_for_image(image, page=page_number, enhance=enhance)
+                    ocr_elapsed = time.perf_counter() - ocr_start
+                    logger.debug(
+                        "OCR page %d/%d: render=%.2fs ocr=%.2fs accuracy=%.1f%%",
+                        page_number, page_count, render_elapsed, ocr_elapsed, accuracy,
+                    )
                     results.extend(results_for_page)
                     if accuracy:
                         all_confidences.append(accuracy)
