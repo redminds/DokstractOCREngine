@@ -3,29 +3,39 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+
     env_file:
-      - ${SERVICE_ENV_FILE}
+      - ${ENV_FILE}
+
     environment:
       OCR_ENGINE_OCR_API_TOKEN: ${OCR_ENGINE_OCR_API_TOKEN:?OCR_ENGINE_OCR_API_TOKEN is required}
       OCR_ENGINE_SCHEMA_API_TOKEN: ${OCR_ENGINE_SCHEMA_API_TOKEN:?OCR_ENGINE_SCHEMA_API_TOKEN is required}
       ENGINE_ADMIN_TOKEN: ${ENGINE_ADMIN_TOKEN:?ENGINE_ADMIN_TOKEN is required}
+
       ENGINE_MAX_INFLIGHT_REQUESTS: ${ENGINE_MAX_INFLIGHT_REQUESTS:-2}
+      OCR_MAX_CONCURRENCY: ${OCR_MAX_CONCURRENCY:-2}
+
     ports:
       - "127.0.0.1:${ENGINE_HOST_PORT:?ENGINE_HOST_PORT is required}:8010"
+
     volumes:
       - ../.data:/app/.data
+
     restart: unless-stopped
+
     healthcheck:
       test:
         [
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health/ready').read()",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health/ready', timeout=5).read()",
         ]
       interval: 30s
-      timeout: 5s
+      timeout: 10s
       retries: 3
+      start_period: 600s
+
     networks:
       - dokstract-shared
 
