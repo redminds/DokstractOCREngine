@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-import threading
-from contextlib import contextmanager
+import asyncio
+import logging
+import time
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
+from starlette.concurrency import run_in_threadpool
 
 from app.core.config import SETTINGS
 from app.core.ocr_execution import OCRDependencyUnavailable, extract_internal_ocr_document
@@ -12,8 +15,9 @@ from app.core.security import authenticate_service
 from app.core.service import OCREngineService
 
 
+logger = logging.getLogger("dokstract.ocr_engine.routes")
 router = APIRouter(prefix="/api/v1/internal/ocr", tags=["ocr"])
-_ENGINE_REQUEST_GATE = threading.BoundedSemaphore(max(1, SETTINGS.engine_max_inflight_requests))
+_OCR_CONCURRENCY_SEMAPHORE = asyncio.Semaphore(max(1, SETTINGS.ocr_max_concurrency))
 _AUTHORIZED_PROJECT_KEYS = {"ocr-api": "ocr", "schema-api": "schema"}
 _ROUTE_ALLOWLIST = {
     "extract": {"ocr-api", "schema-api"},
@@ -32,19 +36,19 @@ def _parse_capabilities(raw: str | None, fallback: tuple[str, ...]) -> tuple[str
     return tuple(item.strip() for item in value.split(",") if item.strip())
 
 
-@contextmanager
-def _acquire_engine_request_slot():
-    if not _ENGINE_REQUEST_GATE.acquire(blocking=False):
-        raise HTTPException(status_code=429, detail="OCR engine is busy. Please retry.")
+@asynccontextmanager
+async def _acquire_engine_request_slot():
+    """Acquire a concurrency slot.  Waits if no slots are available."""
+    await _OCR_CONCURRENCY_SEMAPHORE.acquire()
     try:
         yield
     finally:
-        _ENGINE_REQUEST_GATE.release()
+        _OCR_CONCURRENCY_SEMAPHORE.release()
 
 
 @router.post("/extract")
 @router.post("/auto")
-def extract_document(
+async def extract_document(
     request: Request,
     file: UploadFile = File(...),
     project_key: str = Form("schema"),
@@ -97,10 +101,12 @@ def extract_document(
         }
         raise HTTPException(status_code=403, detail=detail)
 
-    with _acquire_engine_request_slot():
-        raw_bytes = file.file.read()
+    total_start = time.perf_counter()
+    async with _acquire_engine_request_slot():
+        raw_bytes = await file.read()
         try:
-            payload = extract_internal_ocr_document(
+            payload = await run_in_threadpool(
+                extract_internal_ocr_document,
                 file_bytes=raw_bytes,
                 filename=file.filename or "uploaded-file",
                 content_type=file.content_type,
@@ -113,6 +119,14 @@ def extract_document(
             message = str(exc)
             status_code = 413 if "Maximum" in message or "too large" in message.lower() else 400
             raise HTTPException(status_code=status_code, detail=message) from exc
+
+    total_elapsed = time.perf_counter() - total_start
+    page_count = payload.get("pages", 1)
+    line_count = payload.get("lines", 0)
+    logger.info(
+        "OCR request completed: file=%s pages=%d lines=%d total_seconds=%.2f",
+        file.filename or "uploaded-file", page_count, line_count, total_elapsed,
+    )
 
     release = outcome.assigned_release
     payload.update(

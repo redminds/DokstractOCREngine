@@ -39,6 +39,7 @@ class EngineSettings:
     ocr_max_pdf_pages_per_request: int = int(os.getenv("OCR_MAX_PDF_PAGES_PER_REQUEST", "15"))
     digital_pdf_text_threshold: int = int(os.getenv("OCR_DIGITAL_TEXT_THRESHOLD", "200"))
     engine_max_inflight_requests: int = int(os.getenv("ENGINE_MAX_INFLIGHT_REQUESTS", "2"))
+    ocr_max_concurrency: int = int(os.getenv("OCR_MAX_CONCURRENCY", "2"))
 
     @property
     def registry_path(self) -> Path:

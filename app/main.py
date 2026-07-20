@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.routes.admin import router as admin_router
@@ -25,8 +27,24 @@ async def lifespan(app: FastAPI):
     logger.info("Starting OCR Engine Service")
     validate_startup_configuration()
     engine_service.initialize()
+    logger.info("Initializing OCR model (PaddleOCR)...")
+    init_start = time.perf_counter()
+    try:
+        await run_in_threadpool(_warm_up_ocr_engine)
+        init_elapsed = time.perf_counter() - init_start
+        logger.info("OCR model initialized successfully in %.2fs", init_elapsed)
+    except Exception as exc:
+        logger.error("OCR model initialization failed: %s", exc)
+        raise
     yield
     logger.info("Stopping OCR Engine Service")
+
+
+def _warm_up_ocr_engine() -> None:
+    """Preload the OCR model so the first request does not pay the init cost."""
+    from app.core.ocr_execution import _get_ocr_engine
+
+    _get_ocr_engine()
 
 
 app = FastAPI(
@@ -70,7 +88,7 @@ def health_live():
         "status": "ok",
         "service": SETTINGS.service_name,
         "live": True,
-        "ready": False,
+        "ready": True,
     }
 
 
