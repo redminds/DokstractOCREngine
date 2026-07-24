@@ -14,7 +14,7 @@ RUN apt-get update \
         libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd -r dokstract && useradd -r -g dokstract -d /app -s /sbin/nologin dokstract \
-    && mkdir -p /app/.data /app/logs \
+    && mkdir -p /app/.data /app/logs /app/.data/ocr-cache \
     && chown -R dokstract:dokstract /app
 
 COPY requirements.lock.txt .
