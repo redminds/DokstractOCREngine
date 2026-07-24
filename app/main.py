@@ -27,6 +27,8 @@ async def lifespan(app: FastAPI):
     logger.info("Starting OCR Engine Service")
     validate_startup_configuration()
     engine_service.initialize()
+    # Clean up stale temporary files from previous runs
+    await run_in_threadpool(_sweep_stale_temp)
     logger.info("Initializing OCR model (PaddleOCR)...")
     init_start = time.perf_counter()
     try:
@@ -36,6 +38,8 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.error("OCR model initialization failed: %s", exc)
         raise
+    # Initialize cache directory
+    await run_in_threadpool(_init_cache_dir)
     yield
     logger.info("Stopping OCR Engine Service")
 
@@ -43,8 +47,22 @@ async def lifespan(app: FastAPI):
 def _warm_up_ocr_engine() -> None:
     """Preload the OCR model so the first request does not pay the init cost."""
     from app.core.ocr_execution import _get_ocr_engine
-
     _get_ocr_engine()
+
+
+def _sweep_stale_temp() -> None:
+    """Clean up stale OCR temporary directories from previous runs."""
+    from app.services.ocr_cache import sweep_stale_temp
+    removed = sweep_stale_temp()
+    if removed:
+        logger.info("Startup: removed %d stale temp directories", removed)
+
+
+def _init_cache_dir() -> None:
+    """Ensure the OCR result cache directory exists."""
+    from pathlib import Path
+    from app.core.config import SETTINGS
+    Path(SETTINGS.ocr_result_cache_dir).mkdir(parents=True, exist_ok=True)
 
 
 app = FastAPI(

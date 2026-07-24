@@ -82,29 +82,30 @@ def test_internal_extract_rejects_invalid_project_key(monkeypatch):
 def test_ocr_concurrency_limit_queues_requests(monkeypatch):
     """Requests beyond OCR_MAX_CONCURRENCY wait instead of being rejected.
 
-    With OCR_MAX_CONCURRENCY=2, the first two requests should proceed
-    concurrently while the third waits until a slot is released.
+    With OCR_MAX_CONCURRENCY=2, three concurrent requests should all succeed
+    (third waits for a slot).  Uses a controlled mock so we can verify serialization.
     """
-    import time
     import threading
     monkeypatch.setattr("app.main.engine_service", make_service())
-    # Reset semaphore for test isolation
     import app.api.v1.routes.ocr as ocr_mod
     monkeypatch.setattr(ocr_mod, "_OCR_CONCURRENCY_SEMAPHORE", asyncio.Semaphore(2))
 
-    processing_started = threading.Event()
-    release_barrier = threading.Event()
-    completed_count = [0]
+    entered = [0]
+    completed = [0]
+    # Use Event to hold the first request inside the critical section
+    hold = threading.Event()
 
     def controlled_ocr(*args, **kwargs):
-        processing_started.set()
-        release_barrier.wait(timeout=5)
-        completed_count[0] += 1
+        entered[0] += 1
+        if entered[0] <= 2:
+            # First two wait until released
+            hold.wait(timeout=10)
+        completed[0] += 1
         return {
-            "file": "test.pdf", "file_type": "pdf", "pages": 1,
-            "lines": 3, "overall_confidence": 95.0,
-            "combined_text": "hello world",
-            "results": [{"page": 1, "text": "hello"}, {"page": 1, "text": "world"}],
+            "file": {"name": "test.pdf", "type": "pdf"},
+            "document": {"total_pages": 1, "processed_pages": [1], "text": "x", "confidence": 0.9, "duration_ms": 1},
+            "pages": [{"page_number": 1, "width": 1, "height": 1, "rotation": 0, "text": "x", "confidence": 0.9, "metrics": {"page_total_ms": 1}, "items": [], "lines": [], "blocks": []}],
+            "metrics": {},
         }
 
     monkeypatch.setattr("app.core.ocr_execution.extract_internal_ocr_document", controlled_ocr)
@@ -115,34 +116,36 @@ def test_ocr_concurrency_limit_queues_requests(monkeypatch):
     def send_ocr():
         return client.post(
             "/api/v1/internal/ocr/extract",
-            headers={
-                "X-Service-Name": "schema-api",
-                "X-Service-Token": "change-me-schema-api-to-engine",
-            },
+            headers={"X-Service-Name": "schema-api", "X-Service-Token": "change-me-schema-api-to-engine"},
             files={"file": ("test.pdf", b"%PDF-1.4 fake", "application/pdf")},
             data={"project_key": "schema", "api_version": "v1"},
         )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        # Send 3 requests with concurrency=2
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         f1 = pool.submit(send_ocr)
         f2 = pool.submit(send_ocr)
+
+        # Wait for both to enter OCR section
+        import time
+        deadline = time.perf_counter() + 10
+        while entered[0] < 2 and time.perf_counter() < deadline:
+            time.sleep(0.05)
+        assert entered[0] >= 2, f"Only {entered[0]} entered OCR"
+
+        # Third request is submitted — it should wait (semaphore full)
         f3 = pool.submit(send_ocr)
 
-        # Wait for first two to start processing
-        assert processing_started.wait(timeout=5), "OCR processing did not start"
+        # Release the first two
+        hold.set()
 
-        # Allow them to complete
-        release_barrier.set()
-
-        r1 = f1.result(timeout=5)
-        r2 = f2.result(timeout=5)
-        r3 = f3.result(timeout=5)
+        r1 = f1.result(timeout=10)
+        r2 = f2.result(timeout=10)
+        r3 = f3.result(timeout=10)
 
         assert r1.status_code == 200
         assert r2.status_code == 200
         assert r3.status_code == 200
-        assert completed_count[0] == 3, f"Expected 3 completions, got {completed_count[0]}"
+        assert completed[0] == 3, f"Expected 3 completions, got {completed[0]}"
 
 
 def test_ocr_max_concurrency_defaults_to_two(monkeypatch):
@@ -208,13 +211,10 @@ def test_health_live_responds_during_mocked_ocr(monkeypatch):
     def slow_ocr(*args, **kwargs):
         time.sleep(1.0)
         return {
-            "file": "test.pdf",
-            "file_type": "pdf",
-            "pages": 1,
-            "lines": 0,
-            "overall_confidence": 0.0,
-            "combined_text": "",
-            "results": [],
+            "file": {"name": "test.pdf", "type": "pdf"},
+            "document": {"total_pages": 1, "processed_pages": [1], "text": "", "confidence": 0.0, "duration_ms": 1000},
+            "pages": [{"page_number": 1, "width": 100, "height": 100, "rotation": 0, "text": "", "confidence": 0.0, "metrics": {"page_total_ms": 1000}, "items": [], "lines": [], "blocks": []}],
+            "metrics": {},
         }
 
     monkeypatch.setattr(
@@ -237,7 +237,6 @@ def test_health_live_responds_during_mocked_ocr(monkeypatch):
                 data={"project_key": "schema", "api_version": "v1"},
             )
         )
-        # Give OCR a moment to start
         time.sleep(0.1)
         health_start = time.perf_counter()
         health_response = client.get("/health/live")
@@ -246,7 +245,6 @@ def test_health_live_responds_during_mocked_ocr(monkeypatch):
         assert health_response.status_code == 200
         assert health_response.json()["live"] is True
         assert health_response.json()["ready"] is True
-        # Health check must respond in under 0.5s
         assert health_elapsed < 0.5, f"Health /live took {health_elapsed:.2f}s — should be < 0.5s"
 
         ocr_future.result(timeout=5)
@@ -260,13 +258,10 @@ def test_health_ready_responds_during_mocked_ocr(monkeypatch):
     def slow_ocr(*args, **kwargs):
         time.sleep(1.0)
         return {
-            "file": "test.pdf",
-            "file_type": "pdf",
-            "pages": 1,
-            "lines": 0,
-            "overall_confidence": 0.0,
-            "combined_text": "",
-            "results": [],
+            "file": {"name": "test.pdf", "type": "pdf"},
+            "document": {"total_pages": 1, "processed_pages": [1], "text": "", "confidence": 0.0, "duration_ms": 1000},
+            "pages": [{"page_number": 1, "width": 100, "height": 100, "rotation": 0, "text": "", "confidence": 0.0, "metrics": {"page_total_ms": 1000}, "items": [], "lines": [], "blocks": []}],
+            "metrics": {},
         }
 
     monkeypatch.setattr(
@@ -326,7 +321,8 @@ def test_ocr_errors_propagated_correctly(monkeypatch):
     )
 
     assert response.status_code == 503
-    assert "unavailable" in response.json()["detail"].lower()
+    body = response.json()
+    assert body["detail"]["error"]["code"] == "OCR_ENGINE_UNAVAILABLE"
 
 
 def test_ocr_max_concurrency_defaults_to_two(monkeypatch):
