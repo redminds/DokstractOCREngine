@@ -46,9 +46,8 @@ class EngineSettings:
     ocr_max_image_total_pixels: int = int(os.getenv("OCR_MAX_IMAGE_TOTAL_PIXELS", str(80_000_000)))
     ocr_max_total_rendered_pixels_per_request: int = int(os.getenv("OCR_MAX_TOTAL_RENDERED_PIXELS_PER_REQUEST", str(300_000_000)))
     ocr_max_page_aspect_ratio: float = float(os.getenv("OCR_MAX_PAGE_ASPECT_RATIO", "15.0"))
-    # Stitched-page detection
+    # Stitched-page detection (page-level, does NOT reject wholesale)
     ocr_stitched_page_detection_enabled: bool = os.getenv("OCR_STITCHED_PAGE_DETECTION_ENABLED", "true").strip().lower() == "true"
-    ocr_stitched_page_action: str = os.getenv("OCR_STITCHED_PAGE_ACTION", "reject").strip().lower()
     ocr_stitched_page_aspect_signal_threshold: float = float(os.getenv("OCR_STITCHED_PAGE_ASPECT_SIGNAL_THRESHOLD", "4.0"))
     ocr_stitched_page_confidence_threshold: float = float(os.getenv("OCR_STITCHED_PAGE_CONFIDENCE_THRESHOLD", "0.5"))
     digital_pdf_text_threshold: int = int(os.getenv("OCR_DIGITAL_TEXT_THRESHOLD", "200"))
@@ -124,8 +123,6 @@ def validate_startup_configuration() -> None:
         raise RuntimeError("OCR_MAX_TOTAL_RENDERED_PIXELS_PER_REQUEST must be positive.")
     if SETTINGS.ocr_max_page_aspect_ratio < 1.0:
         raise RuntimeError("OCR_MAX_PAGE_ASPECT_RATIO must be >= 1.0.")
-    if SETTINGS.ocr_stitched_page_action not in ("reject", "warn", "allow"):
-        raise RuntimeError("OCR_STITCHED_PAGE_ACTION must be one of: reject, warn, allow.")
     if SETTINGS.ocr_stitched_page_aspect_signal_threshold < 1.0:
         raise RuntimeError("OCR_STITCHED_PAGE_ASPECT_SIGNAL_THRESHOLD must be >= 1.0.")
     if SETTINGS.ocr_stitched_page_aspect_signal_threshold > SETTINGS.ocr_max_page_aspect_ratio:

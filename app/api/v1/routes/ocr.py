@@ -202,11 +202,6 @@ async def extract_document(
                     status_code=413,
                     detail=_error("RESOURCE_LIMIT_EXCEEDED", message),
                 ) from exc
-            if "stitched" in message.lower() or "multiple document pages" in message.lower():
-                raise HTTPException(
-                    status_code=422,
-                    detail=_error("STITCHED_PAGE_DETECTED", message),
-                ) from exc
             raise HTTPException(
                 status_code=400,
                 detail=_error("INVALID_INPUT", message),

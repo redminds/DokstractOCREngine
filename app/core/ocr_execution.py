@@ -298,23 +298,57 @@ def _validate_render_budget(cumulative_pixels: int, page_number: int) -> None:
         )
 
 
-def _check_stitched_page(image: np.ndarray) -> None:
-    """Check for stitched pages and act according to configured policy."""
+def _check_stitched_page(image: np.ndarray) -> str | None:
+    """Check for stitched pages using page-level classification.
+
+    Returns:
+        None if the page is normal or can be handled adaptively.
+        A warning string if the page has extreme characteristics.
+        Raises ValueError only when the page is UNSAFE_TO_RENDER.
+    """
     if not SETTINGS.ocr_stitched_page_detection_enabled:
-        return
-    from app.services.ocr.stitched_detection import detect_stitched_page
-    result = detect_stitched_page(image)
-    if result.suspected_stitched_page:
-        logger.warning(
-            "Stitched page suspected: confidence=%.2f reasons=%s estimated_pages=%d",
-            result.confidence, result.reasons, result.estimated_visual_pages,
+        return None
+
+    from app.services.ocr.page_classification import (
+        classify_page_dimensions, run_stitched_detector_on_image,
+        PageSizeClassification,
+    )
+    height, width = image.shape[:2]
+    classification = classify_page_dimensions(width, height)
+
+    if classification.classification == PageSizeClassification.UNSAFE_TO_RENDER:
+        raise ValueError(
+            f"Page {width}×{height} exceeds safe rendering limits: "
+            f"{'; '.join(classification.triggered_rules)}"
         )
-        if SETTINGS.ocr_stitched_page_action == "reject":
-            raise ValueError(
-                "The uploaded page appears to contain multiple document pages "
-                "combined into one image. Upload the pages separately or as a "
-                "multi-page PDF."
+
+    if classification.classification == PageSizeClassification.NORMAL:
+        return None
+
+    # Run the visual stitched detector for POSSIBLE_STITCHED pages
+    if classification.classification == PageSizeClassification.POSSIBLE_STITCHED:
+        is_stitched = run_stitched_detector_on_image(image)
+        if not is_stitched:
+            logger.info(
+                "page_classified_as_possible_stitched_but_detector_cleared "
+                "width=%d height=%d aspect=%.1f",
+                width, height, classification.aspect_ratio,
             )
+            return None
+        logger.warning(
+            "stitched_page_confirmed width=%d height=%d aspect=%.1f rules=%s",
+            width, height, classification.aspect_ratio,
+            classification.triggered_rules,
+        )
+        return "stitched_confirmed"
+
+    # Large / oversized / extreme aspect — log and continue
+    logger.info(
+        "page_classified_as_%s width=%d height=%d aspect=%.1f recommendation=%s",
+        classification.classification.value, width, height,
+        classification.aspect_ratio, classification.recommendation,
+    )
+    return classification.classification.value
 
 
 @dataclass(frozen=True)
@@ -450,15 +484,37 @@ def _build_results_for_image(
 ) -> tuple[OCRPage, dict[str, float], ProcessingResult | None]:
     """Run OCR with geometry pipeline on a single image.
 
+    Uses page classification to determine adaptive strategy:
+    - NORMAL → standard OCR
+    - LARGE/OVERSIZED → downscale if safe, else tile
+    - POSSIBLE_STITCHED/EXTREME → tile with stitched detector
+    - UNSAFE → raise ValueError
+
     Returns:
         Tuple of (OCRPage, timing_dict, processing_result_or_None).
     """
-    height, width = image.shape[:2]
-    _validate_image_dimensions(width, height)
+    from app.services.ocr.page_classification import (
+        classify_page_dimensions, compute_adaptive_render_plan,
+        tile_image_vertical, reconstruct_page_from_tiles,
+        PageSizeClassification,
+    )
 
+    height, width = image.shape[:2]
     timings: dict[str, float] = {}
 
-    # Image processing
+    # ── Page classification ──────────────────────────────────────────
+    classification = classify_page_dimensions(width, height)
+
+    if classification.classification == PageSizeClassification.UNSAFE_TO_RENDER:
+        raise ValueError(
+            f"Page {page} ({width}×{height}) unsafe to render: "
+            f"{'; '.join(classification.triggered_rules)}"
+        )
+
+    # ── Adaptive render plan ─────────────────────────────────────────
+    plan = compute_adaptive_render_plan(width, height, classification)
+
+    # ── Image processing ─────────────────────────────────────────────
     processing_result: ProcessingResult | None = None
     t0 = time.perf_counter()
     profile = resolve_profile(enhance, profile_name)
@@ -466,13 +522,21 @@ def _build_results_for_image(
     processed_image = processing_result.image
     timings["preprocessing_ms"] = processing_result.duration_ms
 
-    # Stitched-page check
-    _check_stitched_page(processed_image)
+    # ── Stitched check (does NOT reject) ─────────────────────────────
+    stitched_warning = _check_stitched_page(processed_image)
 
-    # OCR inference
+    # ── Execute OCR ──────────────────────────────────────────────────
+    if plan.strategy == "tile":
+        return _build_tiled_page(
+            processed_image, page=page, plan=plan,
+            enhance=enhance, profile_name=profile_name,
+            timings=timings, processing_result=processing_result,
+        )
+
+    # Standard or downscale: single-image OCR
     ocr_start = time.perf_counter()
     try:
-        raw_result = run_ocr(processed_image, enhance=False)  # enhance already applied
+        raw_result = run_ocr(processed_image, enhance=False)
     except OCRDependencyUnavailable:
         raise
     timings["ocr_inference_ms"] = (time.perf_counter() - ocr_start) * 1000.0
@@ -486,15 +550,113 @@ def _build_results_for_image(
         + timings["ocr_inference_ms"]
         + timings["geometry_total_ms"]
     )
-    page_data.page_metrics = {k: round(v, 3) for k, v in timings.items()}
+    page_data.page_metrics = {
+        k: round(v, 3) for k, v in timings.items()
+    }
+    page_data.page_metrics["classification"] = classification.classification.value
+    page_data.page_metrics["render_strategy"] = plan.strategy
+    if stitched_warning:
+        page_data.page_metrics["stitched_warning"] = stitched_warning
 
-    # Safe logging
     if SETTINGS.ocr_log_page_summaries:
         logger.debug(
-            "Page %d: ocr=%.0fms geom=%.0fms items=%d lines=%d",
-            page, timings["ocr_inference_ms"], timings["geometry_total_ms"],
-            len(page_data.items), len(page_data.lines),
+            "Page %d: cls=%s strategy=%s ocr=%.0fms items=%d lines=%d",
+            page, classification.classification.value, plan.strategy,
+            timings["ocr_inference_ms"], len(page_data.items), len(page_data.lines),
         )
+
+    return page_data, timings, processing_result
+
+
+def _build_tiled_page(
+    image: np.ndarray,
+    page: int,
+    plan,
+    enhance: bool,
+    profile_name: str,
+    timings: dict[str, float],
+    processing_result,
+) -> tuple[OCRPage, dict[str, float], ProcessingResult | None]:
+    """Process a page using vertical tiling with coordinate reconstruction."""
+    from app.services.ocr.page_classification import (
+        tile_image_vertical, reconstruct_page_from_tiles,
+    )
+    height, width = image.shape[:2]
+    tiles = tile_image_vertical(image, plan.tile_height, plan.tile_overlap)
+    tile_results: list[dict] = []
+    total_ocr_ms = 0.0
+
+    for tile_img, y_offset in tiles:
+        ocr_start = time.perf_counter()
+        try:
+            raw = run_ocr(tile_img, enhance=False)
+        except OCRDependencyUnavailable:
+            raise
+        total_ocr_ms += (time.perf_counter() - ocr_start) * 1000.0
+
+        tile_page_data, _ = _build_structured_page(raw, page_number=page)
+        tile_results.append({
+            "items": [{
+                "item_id": it.item_id, "text": it.text,
+                "confidence": it.confidence,
+                "bbox": {"x1": it.bbox.x1, "y1": it.bbox.y1,
+                         "x2": it.bbox.x2, "y2": it.bbox.y2},
+            } for it in tile_page_data.items],
+            "lines": [{
+                "line_id": ln.line_id, "text": ln.text,
+                "confidence": ln.confidence,
+                "bbox": {"x1": ln.bbox.x1, "y1": ln.bbox.y1,
+                         "x2": ln.bbox.x2, "y2": ln.bbox.y2},
+            } for ln in tile_page_data.lines],
+            "blocks": [],
+            "tile_y_offset": y_offset,
+        })
+
+    # Reconstruct canonical page
+    reconstructed = reconstruct_page_from_tiles(
+        tile_results, page, width, height,
+    )
+
+    timings["ocr_inference_ms"] = total_ocr_ms
+    timings["tile_count"] = float(len(tiles))
+    timings["geometry_total_ms"] = 0.0
+    timings["page_total_ms"] = (
+        timings["preprocessing_ms"] + total_ocr_ms
+    )
+
+    # Build OCRPage from reconstructed dict
+    items = []
+    for it in reconstructed["items"]:
+        bb = it["bbox"]
+        items.append(OCRItem(
+            item_id=it["item_id"], page_number=page, text=it["text"],
+            confidence=it.get("confidence", 0.9),
+            bbox=BBox(bb["x1"], bb["y1"], bb["x2"], bb["y2"]),
+        ))
+    lines = []
+    for ln in reconstructed["lines"]:
+        lb = ln["bbox"]
+        lines.append(OCRLine(
+            line_id=ln["line_id"], page_number=page, text=ln["text"],
+            confidence=ln.get("confidence", 0.9),
+            bbox=BBox(lb["x1"], lb["y1"], lb["x2"], lb["y2"]),
+        ))
+
+    page_data = OCRPage(
+        page_number=page, width=width, height=height,
+        items=items, lines=lines,
+    )
+    page_data.page_metrics = {
+        k: round(v, 3) for k, v in timings.items()
+    }
+    page_data.page_metrics["classification"] = "tiled"
+    page_data.page_metrics["render_strategy"] = "tile"
+    page_data.page_metrics["tile_count"] = len(tiles)
+
+    logger.info(
+        "Page %d: tiled=%d tiles ocr=%.0fms lines=%d",
+        page, len(tiles), total_ocr_ms, len(lines),
+    )
 
     return page_data, timings, processing_result
 
@@ -853,25 +1015,37 @@ def extract_internal_ocr_document(
                         image = pdf_page_to_img(page, eff_scale)
                         metrics["rendering_ms"] += (time.perf_counter() - render_start) * 1000.0
 
-                        # OCR + geometry pipeline
-                        ocrpage, page_timings, proc_result = _build_results_for_image(
-                            image, page=page_number, enhance=enhance, profile_name=profile_name,
-                        )
-                        for key in metrics:
-                            metrics[key] += page_timings.get(key, 0.0)
-                        if proc_result and not processing_meta:
-                            processing_meta = {
-                                "operations_applied": proc_result.operations_applied,
-                                "operations_skipped": proc_result.operations_skipped,
-                            }
-                        # Add rendering metadata
-                        ocrpage.page_metrics["rendering_profile"] = rendering_profile
-                        ocrpage.page_metrics["render_scale"] = round(page_scale, 2)
-                        ocrpage.page_metrics["render_dpi"] = round(page_scale * 72, 1)
-                        pages_data.append(ocrpage)
+                        # OCR + geometry pipeline (with per-page error handling)
+                        try:
+                            ocrpage, page_timings, proc_result = _build_results_for_image(
+                                image, page=page_number, enhance=enhance, profile_name=profile_name,
+                            )
+                            for key in metrics:
+                                metrics[key] += page_timings.get(key, 0.0)
+                            if proc_result and not processing_meta:
+                                processing_meta = {
+                                    "operations_applied": proc_result.operations_applied,
+                                    "operations_skipped": proc_result.operations_skipped,
+                                }
+                            # Add rendering metadata
+                            ocrpage.page_metrics["rendering_profile"] = rendering_profile
+                            ocrpage.page_metrics["render_scale"] = round(page_scale, 2)
+                            ocrpage.page_metrics["render_dpi"] = round(page_scale * 72, 1)
+                            pages_data.append(ocrpage)
 
-                        # Cache page immediately
-                        _cache_page_now(file_hash, page_number, pfp, ocrpage, cache_failures)
+                            # Cache page immediately
+                            _cache_page_now(file_hash, page_number, pfp, ocrpage, cache_failures)
+                        except ValueError as page_exc:
+                            # Per-page failure — record and continue to next page
+                            msg = str(page_exc)
+                            logger.warning("Page %d failed: %s", page_number, msg[:200])
+                            error_page = OCRPage(page_number=page_number, width=rw, height=rh)
+                            error_page.page_metrics = {
+                                "source": "error",
+                                "error": msg[:200],
+                                "rendering_profile": rendering_profile,
+                            }
+                            pages_data.append(error_page)
                 finally:
                     doc.close()
             else:
@@ -888,21 +1062,28 @@ def extract_internal_ocr_document(
                     image = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), 1)
                     if image is None:
                         raise ValueError("Invalid image")
-                    ocrpage, page_timings, proc_result = _build_results_for_image(
-                        image, page=1, enhance=enhance, profile_name=profile_name,
-                    )
-                    for key in metrics:
-                        metrics[key] = page_timings.get(key, 0.0)
-                    if proc_result:
-                        processing_meta = {
-                            "operations_applied": proc_result.operations_applied,
-                            "operations_skipped": proc_result.operations_skipped,
-                        }
-                    ocrpage.page_metrics["rendering_profile"] = "standard"
-                    ocrpage.page_metrics["render_scale"] = round(img_scale, 2)
-                    ocrpage.page_metrics["render_dpi"] = round(img_scale * 72, 1)
-                    pages_data.append(ocrpage)
-                    _cache_page_now(file_hash, 1, pfp, ocrpage, cache_failures)
+                    try:
+                        ocrpage, page_timings, proc_result = _build_results_for_image(
+                            image, page=1, enhance=enhance, profile_name=profile_name,
+                        )
+                        for key in metrics:
+                            metrics[key] = page_timings.get(key, 0.0)
+                        if proc_result:
+                            processing_meta = {
+                                "operations_applied": proc_result.operations_applied,
+                                "operations_skipped": proc_result.operations_skipped,
+                            }
+                        ocrpage.page_metrics["rendering_profile"] = "standard"
+                        ocrpage.page_metrics["render_scale"] = round(img_scale, 2)
+                        ocrpage.page_metrics["render_dpi"] = round(img_scale * 72, 1)
+                        pages_data.append(ocrpage)
+                        _cache_page_now(file_hash, 1, pfp, ocrpage, cache_failures)
+                    except ValueError as page_exc:
+                        msg = str(page_exc)
+                        logger.warning("Image page failed: %s", msg[:200])
+                        error_page = OCRPage(page_number=1, width=0, height=0)
+                        error_page.page_metrics = {"source": "error", "error": msg[:200]}
+                        pages_data.append(error_page)
     finally:
         # Temp directory cleaned by context manager; rendered images are
         # always deleted when the temp dir is removed.
