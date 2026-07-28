@@ -20,6 +20,7 @@ services:
 
     volumes:
       - ../.data:/app/.data
+      - ocr-cache:/app/.data/ocr-cache
 
     restart: unless-stopped
 
@@ -43,3 +44,6 @@ networks:
   dokstract-shared:
     external: true
     name: dokstract-shared
+
+volumes:
+  ocr-cache:

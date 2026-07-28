@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Reque
 from starlette.concurrency import run_in_threadpool
 
 from app.core.config import SETTINGS
-from app.core.ocr_execution import OCRDependencyUnavailable, extract_internal_ocr_document
+from app.core import ocr_execution
 from app.core.security import authenticate_service
 from app.core.service import OCREngineService
 
@@ -24,6 +24,43 @@ _ROUTE_ALLOWLIST = {
     "auto": {"schema-api"},
 }
 
+_CHUNK_SIZE = 64 * 1024  # 64 KB streaming chunks
+
+
+def _error(code: str, message: str, details: dict | None = None) -> dict:
+    """Build a structured error response body."""
+    body: dict = {"error": {"code": code, "message": message}}
+    if details:
+        body["error"]["details"] = details
+    return body
+
+
+async def _read_upload_with_limit(upload: UploadFile, max_bytes: int) -> bytes:
+    """Read upload in bounded chunks, rejecting if limit exceeded."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await upload.read(_CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                status_code=413,
+                detail=_error(
+                    "UPLOAD_SIZE_LIMIT_EXCEEDED",
+                    "The uploaded file exceeds the maximum supported size.",
+                    {"max_bytes": max_bytes, "received_bytes": total},
+                ),
+            )
+        chunks.append(chunk)
+    if total == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=_error("EMPTY_UPLOAD", "Empty file uploaded."),
+        )
+    return b"".join(chunks)
+
 
 def get_engine_service() -> OCREngineService:
     from app.main import engine_service
@@ -34,17 +71,49 @@ def get_engine_service() -> OCREngineService:
 def _parse_capabilities(raw: str | None, fallback: tuple[str, ...]) -> tuple[str, ...]:
     value = raw if raw is not None else ",".join(fallback)
     return tuple(item.strip() for item in value.split(",") if item.strip())
+_CHUNK_SIZE = 64 * 1024  # 64 KB streaming chunks
+
+# Lightweight bounded concurrency guard
+_OCR_QUEUE_SEMAPHORE: asyncio.Semaphore | None = None
+
+
+def _get_queue_semaphore() -> asyncio.Semaphore:
+    global _OCR_QUEUE_SEMAPHORE
+    if _OCR_QUEUE_SEMAPHORE is None:
+        _OCR_QUEUE_SEMAPHORE = asyncio.Semaphore(SETTINGS.ocr_max_queued_requests)
+    return _OCR_QUEUE_SEMAPHORE
 
 
 @asynccontextmanager
 async def _acquire_engine_request_slot():
-    """Acquire a concurrency slot.  Waits if no slots are available."""
-    await _OCR_CONCURRENCY_SEMAPHORE.acquire()
+    """Acquire a processing slot with bounded queue and timeout."""
+    queue_sem = _get_queue_semaphore()
+    queue_acquired = False
     try:
+        try:
+            queue_acquired = await asyncio.wait_for(
+                queue_sem.acquire(), timeout=SETTINGS.ocr_queue_wait_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=429,
+                detail=_error("QUEUE_FULL", "Request queue is full. Retry later."),
+            )
+        try:
+            await asyncio.wait_for(
+                _OCR_CONCURRENCY_SEMAPHORE.acquire(),
+                timeout=SETTINGS.ocr_queue_wait_timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=503,
+                detail=_error("QUEUE_TIMEOUT", "Timed out waiting for processing slot."),
+            )
         yield
     finally:
         _OCR_CONCURRENCY_SEMAPHORE.release()
-
+        if queue_acquired:
+            queue_sem.release()
 
 @router.post("/extract")
 @router.post("/auto")
@@ -55,6 +124,7 @@ async def extract_document(
     api_version: str = Form("v1"),
     capabilities: str | None = Form(None),
     image_processing: str = Form("false"),
+    image_processing_profile: str = Form("none"),
     pages: str | None = Form(None),
     x_request_id: str | None = Header(default=None, alias="X-Request-ID"),
     x_correlation_id: str | None = Header(default=None, alias="X-Correlation-ID"),
@@ -103,29 +173,46 @@ async def extract_document(
 
     total_start = time.perf_counter()
     async with _acquire_engine_request_slot():
-        raw_bytes = await file.read()
+        raw_bytes = await _read_upload_with_limit(file, SETTINGS.ocr_max_upload_bytes)
         try:
             payload = await run_in_threadpool(
-                extract_internal_ocr_document,
+                ocr_execution.extract_internal_ocr_document,
                 file_bytes=raw_bytes,
                 filename=file.filename or "uploaded-file",
                 content_type=file.content_type,
                 image_processing=image_processing,
                 pages=pages,
+                image_processing_profile=image_processing_profile,
             )
-        except OCRDependencyUnavailable as exc:
-            raise HTTPException(status_code=503, detail="OCR engine unavailable.") from exc
+        except ocr_execution.OCRDependencyUnavailable as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=_error("OCR_ENGINE_UNAVAILABLE", "OCR engine is temporarily unavailable."),
+            ) from exc
+        except RuntimeError as exc:
+            # Cache write failure when required
+            raise HTTPException(
+                status_code=503,
+                detail=_error("CACHE_WRITE_FAILED", str(exc)),
+            ) from exc
         except ValueError as exc:
             message = str(exc)
-            status_code = 413 if "Maximum" in message or "too large" in message.lower() else 400
-            raise HTTPException(status_code=status_code, detail=message) from exc
+            if "Maximum" in message or "too large" in message.lower() or "pixel" in message.lower() or "exceeds" in message.lower():
+                raise HTTPException(
+                    status_code=413,
+                    detail=_error("RESOURCE_LIMIT_EXCEEDED", message),
+                ) from exc
+            raise HTTPException(
+                status_code=400,
+                detail=_error("INVALID_INPUT", message),
+            ) from exc
 
     total_elapsed = time.perf_counter() - total_start
-    page_count = payload.get("pages", 1)
-    line_count = payload.get("lines", 0)
+    page_count = len(payload.get("pages", []))
+    item_count = sum(len(p.get("items", [])) for p in payload.get("pages", []))
     logger.info(
-        "OCR request completed: file=%s pages=%d lines=%d total_seconds=%.2f",
-        file.filename or "uploaded-file", page_count, line_count, total_elapsed,
+        "OCR request completed: file=%s pages=%d items=%d total_seconds=%.2f",
+        file.filename or "uploaded-file", page_count, item_count, total_elapsed,
     )
 
     release = outcome.assigned_release
