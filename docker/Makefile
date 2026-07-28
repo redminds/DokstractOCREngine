@@ -44,14 +44,16 @@ resolve_path = $(if $(filter /%,$(1)),$(1),$(abspath $(MAKEFILE_DIR)/$(1)))
 RESOLVED_ENV_FILE := $(call resolve_path,$(ENV_FILE))
 RESOLVED_COMPOSE_FILE := $(call resolve_path,$(COMPOSE_FILE))
 
-#exporting this variable so compose file uses this variable for env configuration
+# Exporting this variable so the Compose file uses this variable
+# for service environment configuration.
 SERVICE_ENV_FILE ?= $(RESOLVED_ENV_FILE)
 export SERVICE_ENV_FILE
+
 # -----------------------------------------------------------------------------
 # Docker Compose configuration
 # -----------------------------------------------------------------------------
 
-COMPOSE_PROJECT_NAME ?= dokstract-ocr-engine
+# COMPOSE_PROJECT_NAME is loaded by Docker Compose from RESOLVED_ENV_FILE.
 COMPOSE_SERVICE ?= ocr-engine
 
 WAIT_TIMEOUT_SECONDS ?= 600
@@ -60,7 +62,6 @@ LOG_TAIL_LINES ?= 100
 
 DOCKER_COMPOSE = docker compose \
 	--env-file "$(RESOLVED_ENV_FILE)" \
-	-p "$(COMPOSE_PROJECT_NAME)" \
 	-f "$(RESOLVED_COMPOSE_FILE)"
 
 # -----------------------------------------------------------------------------
@@ -94,7 +95,7 @@ help:
 		'Resolved defaults:' \
 		'  Environment file: $(RESOLVED_ENV_FILE)' \
 		'  Compose file:     $(RESOLVED_COMPOSE_FILE)' \
-		'  Compose project:  $(COMPOSE_PROJECT_NAME)' \
+		'  Compose project:  loaded from $(RESOLVED_ENV_FILE)' \
 		'  Compose service:  $(COMPOSE_SERVICE)'
 
 # -----------------------------------------------------------------------------
@@ -137,7 +138,7 @@ preflight:
 	@printf '%s\n' \
 		"[preflight] Environment file: $(RESOLVED_ENV_FILE)" \
 		"[preflight] Compose file: $(RESOLVED_COMPOSE_FILE)" \
-		"[preflight] Compose project: $(COMPOSE_PROJECT_NAME)" \
+		"[preflight] Compose project: loaded from $(RESOLVED_ENV_FILE)" \
 		"[preflight] Compose service: $(COMPOSE_SERVICE)"
 
 # -----------------------------------------------------------------------------
@@ -270,7 +271,6 @@ deploy: preflight
 	$(MAKE) health \
 		ENV_FILE="$(RESOLVED_ENV_FILE)" \
 		COMPOSE_FILE="$(RESOLVED_COMPOSE_FILE)" \
-		COMPOSE_PROJECT_NAME="$(COMPOSE_PROJECT_NAME)" \
 		COMPOSE_SERVICE="$(COMPOSE_SERVICE)" \
 		WAIT_TIMEOUT_SECONDS="$(WAIT_TIMEOUT_SECONDS)" \
 		WAIT_INTERVAL_SECONDS="$(WAIT_INTERVAL_SECONDS)" \
