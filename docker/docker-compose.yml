@@ -43,7 +43,7 @@ services:
 networks:
   dokstract-shared:
     external: true
-    name: dokstract-shared
+    name: ${DOKSTRACT_SHARED_NETWORK:?DOKSTRACT_SHARED_NETWORK is required}
 
 volumes:
   ocr-cache:
