@@ -38,21 +38,21 @@ services:
       start_period: 600s
 
     networks:
-      dokstract-shared:
+      dokstract-primary:
         aliases:
           - ocr-engine
-      dokstract-shared-test:
+      dokstract-secondary:
         aliases:
           - ocr-engine
 
 networks:
-  dokstract-shared:
+  dokstract-primary:
     external: true
     name: ${DOKSTRACT_SHARED_NETWORK:?DOKSTRACT_SHARED_NETWORK is required}
 
-  dokstract-shared-test:
+  dokstract-secondary:
     external: true
-    name: dokstract-shared-test
+    name: ${OCR_ENGINE_SECONDARY_NETWORK:?OCR_ENGINE_SECONDARY_NETWORK is required}
 
 volumes:
   ocr-cache:
