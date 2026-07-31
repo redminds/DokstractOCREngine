@@ -1,0 +1,11 @@
+services:
+  ocr-engine:
+    networks:
+      dokstract-secondary:
+        aliases:
+          - ocr-engine
+
+networks:
+  dokstract-secondary:
+    external: true
+    name: ${OCR_ENGINE_SECONDARY_NETWORK:?OCR_ENGINE_SECONDARY_NETWORK is required}
