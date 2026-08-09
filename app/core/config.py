@@ -70,7 +70,7 @@ class EngineSettings:
     ocr_image_processing_default_enabled: bool = os.getenv("OCR_IMAGE_PROCESSING_DEFAULT_ENABLED", "false").strip().lower() == "true"
     ocr_image_processing_default_profile: str = os.getenv("OCR_IMAGE_PROCESSING_DEFAULT_PROFILE", "none").strip()
     ocr_image_processing_allowed_profiles: tuple[str, ...] = _csv_env("OCR_IMAGE_PROCESSING_ALLOWED_PROFILES", "none,document_standard")
-    ocr_image_processing_pipeline_version: str = os.getenv("OCR_IMAGE_PROCESSING_PIPELINE_VERSION", "1").strip()
+    ocr_image_processing_pipeline_version: str = os.getenv("OCR_IMAGE_PROCESSING_PIPELINE_VERSION", "2").strip()
 
     # ── Deskew ───────────────────────────────────────────────────────────
     ocr_deskew_enabled: bool = os.getenv("OCR_DESKEW_ENABLED", "true").strip().lower() == "true"
@@ -92,6 +92,12 @@ class EngineSettings:
     # ── Blank page detection ─────────────────────────────────────────────
     ocr_blank_page_detection_enabled: bool = os.getenv("OCR_BLANK_PAGE_DETECTION_ENABLED", "true").strip().lower() == "true"
     ocr_blank_page_white_ratio_threshold: float = float(os.getenv("OCR_BLANK_PAGE_WHITE_RATIO_THRESHOLD", "0.995"))
+
+    # ── Debug diagnostics ────────────────────────────────────────────────
+    ocr_debug_diagnostics: bool = os.getenv("OCR_DEBUG_DIAGNOSTICS", "false").strip().lower() == "true"
+    ocr_debug_save_images: bool = os.getenv("OCR_DEBUG_SAVE_IMAGES", "false").strip().lower() == "true"
+    ocr_debug_artifact_dir: str = os.getenv("OCR_DEBUG_ARTIFACT_DIR", "/app/.data/ocr-debug").strip()
+    ocr_debug_retention_hours: int = int(os.getenv("OCR_DEBUG_RETENTION_HOURS", "24"))
 
     # ── Logging ──────────────────────────────────────────────────────────
     ocr_log_page_summaries: bool = os.getenv("OCR_LOG_PAGE_SUMMARIES", "true").strip().lower() == "true"

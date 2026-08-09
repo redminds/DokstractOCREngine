@@ -6,6 +6,7 @@ import json
 
 from app.services.ocr.models import BBox, OCRItem, OCRLine, OCRBlock, OCRPage
 from app.services.ocr.response_builder import build_response
+from app.services.ocr.table_reconstruction import detect_table_region
 
 
 def _make_page(
@@ -313,4 +314,112 @@ class TestCanonicalResponse:
         assert "file_type" not in response
         assert "processed_pages" not in response
         assert "selected_pages" not in response
+
+    def test_serialized_table_page_keeps_item_line_references_resolved(self):
+        # Build a compact but detector-valid table-like page directly with stable table lines.
+        table_items = [
+            OCRItem(
+                item_id="p1_i0",
+                page_number=1,
+                text="H1",
+                confidence=0.9,
+                polygon=[[100, 800], [180, 800], [180, 860], [100, 860]],
+                bbox=BBox(100, 800, 180, 860),
+                normalized_bbox=BBox(0.05, 0.266, 0.09, 0.286),
+            ),
+            OCRItem(
+                item_id="p1_i1",
+                page_number=1,
+                text="H2",
+                confidence=0.9,
+                polygon=[[400, 800], [500, 800], [500, 860], [400, 860]],
+                bbox=BBox(400, 800, 500, 860),
+                normalized_bbox=BBox(0.2, 0.266, 0.25, 0.286),
+            ),
+            OCRItem(
+                item_id="p1_i2",
+                page_number=1,
+                text="H3",
+                confidence=0.9,
+                polygon=[[700, 800], [800, 800], [800, 860], [700, 860]],
+                bbox=BBox(700, 800, 800, 860),
+                normalized_bbox=BBox(0.35, 0.266, 0.4, 0.286),
+            ),
+            OCRItem(
+                item_id="p1_i3",
+                page_number=1,
+                text="H4",
+                confidence=0.9,
+                polygon=[[1000, 800], [1100, 800], [1100, 860], [1000, 860]],
+                bbox=BBox(1000, 800, 1100, 860),
+                normalized_bbox=BBox(0.5, 0.266, 0.55, 0.286),
+            ),
+            OCRItem(
+                item_id="p1_i4",
+                page_number=1,
+                text="H5",
+                confidence=0.9,
+                polygon=[[1300, 800], [1400, 800], [1400, 860], [1300, 860]],
+                bbox=BBox(1300, 800, 1400, 860),
+                normalized_bbox=BBox(0.65, 0.266, 0.7, 0.286),
+            ),
+            OCRItem(
+                item_id="p1_i5",
+                page_number=1,
+                text="D1C1",
+                confidence=0.9,
+                polygon=[[110, 950], [180, 950], [180, 1000], [110, 1000]],
+                bbox=BBox(110, 950, 180, 1000),
+                normalized_bbox=BBox(0.055, 0.316, 0.09, 0.333),
+            ),
+            OCRItem(
+                item_id="p1_i6",
+                page_number=1,
+                text="D1C2",
+                confidence=0.9,
+                polygon=[[410, 950], [500, 950], [500, 1000], [410, 1000]],
+                bbox=BBox(410, 950, 500, 1000),
+                normalized_bbox=BBox(0.205, 0.316, 0.25, 0.333),
+            ),
+            OCRItem(
+                item_id="p1_i7",
+                page_number=1,
+                text="D1C3",
+                confidence=0.9,
+                polygon=[[710, 950], [810, 950], [810, 1000], [710, 1000]],
+                bbox=BBox(710, 950, 810, 1000),
+                normalized_bbox=BBox(0.355, 0.316, 0.405, 0.333),
+            ),
+            OCRItem(
+                item_id="p1_i8",
+                page_number=1,
+                text="D1C4",
+                confidence=0.9,
+                polygon=[[1010, 950], [1110, 950], [1110, 1000], [1010, 1000]],
+                bbox=BBox(1010, 950, 1110, 1000),
+                normalized_bbox=BBox(0.505, 0.316, 0.555, 0.333),
+            ),
+            OCRItem(
+                item_id="p1_i9",
+                page_number=1,
+                text="D1C5",
+                confidence=0.9,
+                polygon=[[1310, 950], [1410, 950], [1410, 1000], [1310, 1000]],
+                bbox=BBox(1310, 950, 1410, 1000),
+                normalized_bbox=BBox(0.655, 0.316, 0.705, 0.333),
+            ),
+        ]
+        lines, _, meta = detect_table_region(table_items, 600, 400)
+        assert meta is not None
+        page = OCRPage(page_number=1, width=600, height=400, items=table_items, lines=lines, blocks=[])
+        response = build_response(
+            pages_data=[page], filename="table.pdf", file_type="pdf",
+            total_pages=1, selected_pages=[1],
+        )
+        p = response["pages"][0]
+        line_ids = {line["line_id"] for line in p["lines"]}
+        assert any(item["line_id"] is not None for item in p["items"])
+        for item in p["items"]:
+            if item["line_id"] is not None:
+                assert item["line_id"] in line_ids
 

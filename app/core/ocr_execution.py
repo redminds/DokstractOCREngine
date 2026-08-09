@@ -48,6 +48,10 @@ from app.services.ocr_cache import (
 
 logger = logging.getLogger("dokstract.ocr_engine.execution")
 
+_TARGETED_FALLBACK_CONFIDENCE_THRESHOLD = 0.55
+_TARGETED_FALLBACK_TEXT_LENGTH_THRESHOLD = 24
+_TARGETED_FALLBACK_MIN_SCORE_IMPROVEMENT = 0.05
+
 
 @dataclass
 class _RawOCRResult:
@@ -58,15 +62,138 @@ class _RawOCRResult:
     image_height: float
 
 
+@dataclass
+class _PageDiagnostics:
+    """Per-page diagnostic data collected during OCR processing."""
+
+    # ── PDF source ────────────────────────────────────────────────────
+    source_width_points: float = 0.0
+    source_height_points: float = 0.0
+    source_rotation: float = 0.0
+
+    # ── Render ───────────────────────────────────────────────────────
+    requested_scale: float = 0.0
+    effective_scale: float = 0.0
+    effective_dpi_x: float = 0.0
+    effective_dpi_y: float = 0.0
+    rendered_width_pixels: float = 0.0
+    rendered_height_pixels: float = 0.0
+    render_duration_ms: float = 0.0
+
+    # ── Preprocessing ────────────────────────────────────────────────
+    preprocessing_requested: bool = False
+    preprocessing_applied: bool = False
+    preprocessing_profile: str = "none"
+    preprocessing_steps: list[str] | None = None
+    preprocessing_input_width: int = 0
+    preprocessing_input_height: int = 0
+    preprocessing_output_width: int = 0
+    preprocessing_output_height: int = 0
+    preprocessing_duration_ms: float = 0.0
+
+    # ── Paddle ───────────────────────────────────────────────────────
+    paddleocr_version: str = ""
+    paddle_version: str = ""
+    detection_model: str = ""
+    recognition_model: str = ""
+    device: str = "cpu"
+    det_limit_side_len: int = 0
+    det_limit_type: str = ""
+    ocr_lang: str = ""
+    cpu_threads: int = 0
+    mkldnn: bool = False
+    use_angle_cls: bool = False
+    use_dilation: bool = True
+    recognition_batch_size: int = 0
+    detector_input_width: int = 0
+    detector_input_height: int = 0
+    detector_resize_status: str = "unavailable"
+    calculated_detector_width: int = 0
+    calculated_detector_height: int = 0
+    calculation_basis: str = ""
+    detector_resize_note: str = ""
+
+    # ── Geometry ────────────────────────────────────────────────────
+    geometry_provider: str = "paddleocr"
+    text_provider: str = "paddleocr"
+    ocr_pass: str = "baseline"
+    render_profile: str = "standard"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source": {
+                "width_points": round(self.source_width_points, 1),
+                "height_points": round(self.source_height_points, 1),
+                "rotation": self.source_rotation,
+            },
+            "render": {
+                "page": 0,
+                "requested_scale": round(self.requested_scale, 4),
+                "effective_scale": round(self.effective_scale, 4),
+                "effective_dpi_x": round(self.effective_dpi_x, 1),
+                "effective_dpi_y": round(self.effective_dpi_y, 1),
+                "dpi_status": "calculated" if self.effective_dpi_x > 0 else "unavailable",
+                "width_pixels": int(self.rendered_width_pixels),
+                "height_pixels": int(self.rendered_height_pixels),
+                "duration_ms": round(self.render_duration_ms, 1),
+            },
+            "preprocessing": {
+                "requested": self.preprocessing_requested,
+                "applied": self.preprocessing_applied,
+                "profile": self.preprocessing_profile,
+                "steps": self.preprocessing_steps or [],
+                "input_width": self.preprocessing_input_width,
+                "input_height": self.preprocessing_input_height,
+                "output_width": self.preprocessing_output_width,
+                "output_height": self.preprocessing_output_height,
+                "duration_ms": round(self.preprocessing_duration_ms, 1),
+            } if self.preprocessing_requested or self.preprocessing_applied else {
+                "requested": False,
+                "applied": False,
+                "profile": "none",
+                "steps": [],
+            },
+            "paddle": {
+                "paddleocr_version": self.paddleocr_version,
+                "paddle_version": self.paddle_version,
+                "detection_model": self.detection_model,
+                "recognition_model": self.recognition_model,
+                "device": self.device,
+                "det_limit_side_len": self.det_limit_side_len,
+                "det_limit_type": self.det_limit_type,
+                "ocr_lang": self.ocr_lang,
+                "cpu_threads": self.cpu_threads,
+                "mkldnn": self.mkldnn,
+                "use_angle_cls": self.use_angle_cls,
+                "use_dilation": self.use_dilation,
+                "recognition_batch_size": self.recognition_batch_size,
+                "input_width": self.detector_input_width,
+                "input_height": self.detector_input_height,
+                "detector_resize_status": self.detector_resize_status,
+                "calculated_detector_width": self.calculated_detector_width,
+                "calculated_detector_height": self.calculated_detector_height,
+                "calculation_basis": self.calculation_basis,
+                "detector_resize_note": self.detector_resize_note,
+            },
+            "geometry": {
+                "geometry_provider": self.geometry_provider,
+                "text_provider": self.text_provider,
+                "ocr_pass": self.ocr_pass,
+                "render_profile": self.render_profile,
+            },
+        }
+
+
 class OCRDependencyUnavailable(RuntimeError):
     pass
 
 
 _OCR_ENGINE = None
+_OCR_ENGINE_DIAGNOSTICS: dict[str, Any] = {}
 
 
 def _get_ocr_engine():
-    global _OCR_ENGINE
+    global _OCR_ENGINE, _OCR_ENGINE_DIAGNOSTICS
     if _OCR_ENGINE is None:
         init_start = time.perf_counter()
         try:
@@ -90,7 +217,76 @@ def _get_ocr_engine():
         init_elapsed = time.perf_counter() - init_start
         logger.info("PaddleOCR model initialized in %.2fs (lang=%s cpu_threads=%d mkldnn=%s)",
                      init_elapsed, SETTINGS.ocr_lang, SETTINGS.ocr_cpu_threads, SETTINGS.ocr_enable_mkldnn)
+
+        # Capture diagnostics
+        _OCR_ENGINE_DIAGNOSTICS.update(_capture_paddle_diagnostics(_OCR_ENGINE))
     return _OCR_ENGINE
+
+
+def _capture_paddle_diagnostics(engine: Any) -> dict[str, Any]:
+    """Capture PaddleOCR version, model, and config diagnostics."""
+    diag: dict[str, Any] = {}
+    paddle_module = None
+    try:
+        import paddleocr
+        diag["paddleocr_version"] = getattr(paddleocr, "__version__", "unknown")
+    except Exception:
+        diag["paddleocr_version"] = "unavailable"
+    try:
+        import paddle as paddle_module
+        diag["paddle_version"] = paddle_module.__version__
+    except Exception:
+        diag["paddle_version"] = "unavailable"
+
+    diag["detection_model"] = "unavailable"
+    diag["recognition_model"] = "unavailable"
+    try:
+        det = getattr(engine, "text_detector", None)
+        if det and hasattr(det, "ckpt_path"):
+            diag["detection_model"] = str(det.ckpt_path).split("/")[-1].replace(".pdparams", "")
+    except Exception:
+        pass
+    try:
+        rec = getattr(engine, "text_recognizer", None)
+        if rec and hasattr(rec, "ckpt_path"):
+            diag["recognition_model"] = str(rec.ckpt_path).split("/")[-1].replace(".pdparams", "")
+    except Exception:
+        pass
+
+    # Use Paddle APIs for device detection when Paddle is available.
+    if paddle_module is not None:
+        try:
+            diag["paddle_device"] = (
+                paddle_module.device.get_device() if hasattr(paddle_module, "device") else "cpu"
+            )
+        except Exception:
+            diag["paddle_device"] = "cpu"
+
+        try:
+            diag["paddle_compiled_with_cuda"] = (
+                paddle_module.is_compiled_with_cuda() if hasattr(paddle_module, "is_compiled_with_cuda") else False
+            )
+        except Exception:
+            diag["paddle_compiled_with_cuda"] = False
+    else:
+        diag["paddle_device"] = "cpu"
+        diag["paddle_compiled_with_cuda"] = False
+
+    diag["device"] = "cuda" if diag.get("paddle_compiled_with_cuda") else "cpu"
+    diag["gpu_available"] = False
+    if diag.get("paddle_compiled_with_cuda"):
+        try:
+            diag["gpu_available"] = paddle.device.is_compiled_with_cuda()
+        except Exception:
+            diag["gpu_available"] = diag.get("paddle_compiled_with_cuda", False)
+
+    return diag
+
+
+def _get_paddle_diagnostics() -> dict[str, Any]:
+    if not _OCR_ENGINE_DIAGNOSTICS:
+        _get_ocr_engine()
+    return dict(_OCR_ENGINE_DIAGNOSTICS)
 
 
 def normalize_text(lines: list[str]) -> str:
@@ -196,6 +392,38 @@ def _build_structured_page(
     )
     timings["line_reconstruction_ms"] = (time.perf_counter() - t0) * 1000.0
 
+    # Step 2b: Table-aware reconstruction — detect and restructure table regions
+    t0 = time.perf_counter()
+    from app.services.ocr.table_reconstruction import detect_table_region
+    table_lines, non_table_lines, _table_meta = detect_table_region(
+        items, raw_result.image_width, raw_result.image_height,
+    )
+    if _table_meta:
+        # Replace the standard lines with table-aware lines for the table region
+        # Keep non-table items as standard lines, append table lines
+        table_item_ids = set()
+        for tl in table_lines:
+            table_item_ids.update(tl.item_ids)
+        remaining_items = [it for it in items if it.item_id not in table_item_ids]
+        remaining_lines = reconstruct_lines(
+            remaining_items, page_width=raw_result.image_width, page_height=raw_result.image_height,
+        ) if remaining_items else []
+        lines = remaining_lines + table_lines
+        from app.services.ocr.line_reconstruction import _sync_item_line_ids
+        _sync_item_line_ids(items, lines)
+        timings["table_reconstruction_ms"] = (time.perf_counter() - t0) * 1000.0
+        logger.info(
+            "Page %d: table detected — %d cols × %d rows, %d table lines, %d non-table lines, confidence=%.2f",
+            page_number,
+            _table_meta.get("column_count", 0),
+            _table_meta.get("row_count", 0),
+            len(table_lines),
+            len(remaining_lines),
+            _table_meta.get("confidence", 0),
+        )
+    else:
+        timings["table_reconstruction_ms"] = (time.perf_counter() - t0) * 1000.0
+
     # Step 3: Reconstruct blocks from lines
     t0 = time.perf_counter()
     blocks = reconstruct_blocks(
@@ -256,6 +484,7 @@ def _build_structured_page(
         text=page_text,
         confidence=page_confidence,
         duration_ms=timings["geometry_total_ms"],
+        table_meta=_table_meta,
     )
 
     return page, timings
@@ -449,12 +678,26 @@ def extract_pdf_text(path: str, page_numbers: list[int] | None = None) -> str:
     return "\n".join(texts)
 
 
-def pdf_page_to_img(page: Any, scale: float):
+@dataclass(frozen=True)
+class PdfRenderResult:
+    """Result of rendering a PDF page to an image, with source metadata."""
+
+    image: np.ndarray
+    source_width_points: float
+    source_height_points: float
+    source_rotation: float
+    effective_scale: float
+
+
+def pdf_page_to_img(page: Any, scale: float) -> PdfRenderResult:
     max_dpi = max(72, int(SETTINGS.ocr_max_render_dpi))
-    scale = min(scale, max_dpi / 72.0)
+    effective_scale = min(scale, max_dpi / 72.0)
     rect = page.rect
-    width = int(rect.width * scale)
-    height = int(rect.height * scale)
+    source_w = rect.width
+    source_h = rect.height
+    source_rot = page.rotation or 0.0
+    width = int(source_w * effective_scale)
+    height = int(source_h * effective_scale)
     if width <= 0 or height <= 0:
         raise ValueError("Invalid PDF page dimensions")
     if width > SETTINGS.ocr_max_image_width or height > SETTINGS.ocr_max_image_height:
@@ -462,7 +705,7 @@ def pdf_page_to_img(page: Any, scale: float):
     if width * height > SETTINGS.ocr_max_image_pixels:
         raise ValueError("Rendered PDF page exceeds pixel limits")
 
-    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
+    pix = page.get_pixmap(matrix=fitz.Matrix(effective_scale, effective_scale))
     decoded = cv2.imdecode(np.frombuffer(pix.tobytes("png"), np.uint8), 1)
     if decoded is None:
         raise ValueError("Rendered PDF page could not be decoded")
@@ -472,7 +715,13 @@ def pdf_page_to_img(page: Any, scale: float):
         raise ValueError("Rendered PDF page exceeds pixel limits")
     if decoded.nbytes > SETTINGS.ocr_max_decoded_image_bytes:
         raise ValueError("Rendered PDF page exceeds decoded memory limits")
-    return decoded
+    return PdfRenderResult(
+        image=decoded,
+        source_width_points=source_w,
+        source_height_points=source_h,
+        source_rotation=source_rot,
+        effective_scale=effective_scale,
+    )
 
 
 def is_digital_pdf_text(text: str, threshold: int) -> bool:
@@ -566,6 +815,92 @@ def _build_results_for_image(
         )
 
     return page_data, timings, processing_result
+
+
+def _resolve_targeted_fallback_profile() -> str:
+    """Return the best enhancement profile for automatic fallback.
+
+    The fallback must stay generic and only use supported image-processing
+    profiles. If the configured default profile is disabled, fall back to the
+    standard document enhancement profile when available.
+    """
+    configured = SETTINGS.ocr_image_processing_default_profile.strip().lower()
+    if configured != "none":
+        return configured
+    if "document_standard" in SETTINGS.ocr_image_processing_allowed_profiles:
+        return "document_standard"
+    return "none"
+
+
+def _page_quality_score(page_data: OCRPage) -> float:
+    """Score a page using only generic OCR quality signals."""
+    text_len = len(page_data.text.strip())
+    return page_data.confidence + min(text_len, 400) / 400.0
+
+
+def _should_attempt_targeted_fallback(page_data: OCRPage, rendering_profile: str, enhance: bool) -> bool:
+    """Decide whether a page deserves a second pass with image processing."""
+    if enhance or rendering_profile == "blank":
+        return False
+    if rendering_profile not in {"low_content", "standard"}:
+        return False
+    text_len = len(page_data.text.strip())
+    return (
+        page_data.confidence < _TARGETED_FALLBACK_CONFIDENCE_THRESHOLD
+        or text_len < _TARGETED_FALLBACK_TEXT_LENGTH_THRESHOLD
+    )
+
+
+def _run_page_with_targeted_fallback(
+    image: np.ndarray,
+    *,
+    page: int,
+    enhance: bool,
+    profile_name: str,
+    rendering_profile: str,
+) -> tuple[OCRPage, dict[str, float], ProcessingResult | None, dict[str, Any] | None]:
+    """Run OCR once, then retry with image processing if a page looks weak."""
+    page_data, page_timings, processing_result = _build_results_for_image(
+        image,
+        page=page,
+        enhance=enhance,
+        profile_name=profile_name,
+    )
+    if not _should_attempt_targeted_fallback(page_data, rendering_profile, enhance):
+        return page_data, page_timings, processing_result, None
+
+    fallback_profile = _resolve_targeted_fallback_profile()
+    if fallback_profile == "none":
+        return page_data, page_timings, processing_result, None
+
+    fallback_page, fallback_timings, fallback_processing = _build_results_for_image(
+        image,
+        page=page,
+        enhance=True,
+        profile_name=fallback_profile,
+    )
+
+    original_score = _page_quality_score(page_data)
+    fallback_score = _page_quality_score(fallback_page)
+    if fallback_score <= original_score + _TARGETED_FALLBACK_MIN_SCORE_IMPROVEMENT:
+        return page_data, page_timings, processing_result, None
+
+    fallback_meta = {
+        "applied": True,
+        "reason": "low_confidence_or_sparse_text",
+        "original": {
+            "confidence": round(page_data.confidence, 4),
+            "text_length": len(page_data.text.strip()),
+            "score": round(original_score, 4),
+        },
+        "fallback": {
+            "confidence": round(fallback_page.confidence, 4),
+            "text_length": len(fallback_page.text.strip()),
+            "score": round(fallback_score, 4),
+            "profile": fallback_profile,
+        },
+    }
+    return fallback_page, fallback_timings, fallback_processing, fallback_meta
 
 
 def _build_tiled_page(
@@ -925,6 +1260,9 @@ def extract_internal_ocr_document(
     cumulative_pixels = 0
     cache_failures: list[int] = []
     preview_scale = 0.5  # cheap ~36 DPI for blank/low-content detection
+    debug_collector: dict[str, Any] = {}
+    debug_pages: list[dict[str, Any]] = []
+    engine_diag = _get_paddle_diagnostics() if SETTINGS.ocr_debug_diagnostics else {}
 
     try:
         with tempfile.TemporaryDirectory(prefix="dokstract-ocr-") as tmp_dir:
@@ -960,8 +1298,14 @@ def extract_internal_ocr_document(
                                 continue
 
                         # ── Cheap preview for blank + low-content detection ──
-                        preview = pdf_page_to_img(page, preview_scale)
+                        render_result = pdf_page_to_img(page, preview_scale)
+                        preview = render_result.image
                         metrics["rendering_ms"] += 0.0  # preview cost negligible
+
+                        # ── Capture source PDF dimensions ────────────────
+                        src_w = render_result.source_width_points
+                        src_h = render_result.source_height_points
+                        src_rot = render_result.source_rotation
 
                         # Blank check on preview
                         if is_blank_page(preview):
@@ -976,6 +1320,12 @@ def extract_internal_ocr_document(
                                 "render_scale": 0.0,
                                 "render_dpi": 0.0,
                             }
+                            if SETTINGS.ocr_debug_diagnostics:
+                                ocrpage.page_metrics.update({
+                                    "source_width_points": round(src_w, 1),
+                                    "source_height_points": round(src_h, 1),
+                                    "source_rotation": src_rot,
+                                })
                             pages_data.append(ocrpage)
                             logger.debug("Page %d: blank, skipped OCR", page_number)
                             pfp = _page_fp(page_number, 0.0)
@@ -1012,13 +1362,43 @@ def extract_internal_ocr_document(
 
                         # ── Render at chosen scale ─────────────────────
                         render_start = time.perf_counter()
-                        image = pdf_page_to_img(page, eff_scale)
-                        metrics["rendering_ms"] += (time.perf_counter() - render_start) * 1000.0
+                        render_result = pdf_page_to_img(page, eff_scale)
+                        image = render_result.image
+                        render_duration = (time.perf_counter() - render_start) * 1000.0
+                        metrics["rendering_ms"] += render_duration
+
+                        # ── Collect render diagnostics ──────────────────
+                        page_diag: dict[str, Any] = {}
+                        if SETTINGS.ocr_debug_diagnostics:
+                            rw_render, rh_render = image.shape[1], image.shape[0]
+                            page_diag = {
+                                "page_number": page_number,
+                                "source": {
+                                    "width_points": round(render_result.source_width_points, 1),
+                                    "height_points": round(render_result.source_height_points, 1),
+                                    "rotation": render_result.source_rotation,
+                                },
+                                "render": {
+                                    "requested_scale": round(page_scale, 4),
+                                    "effective_scale": round(render_result.effective_scale, 4),
+                                    "effective_dpi_x": round(render_result.effective_scale * 72, 1),
+                                    "effective_dpi_y": round(render_result.effective_scale * 72, 1),
+                                    "dpi_status": "calculated",
+                                    "width_pixels": rw_render,
+                                    "height_pixels": rh_render,
+                                    "duration_ms": round(render_duration, 1),
+                                    "rendering_profile": rendering_profile,
+                                },
+                            }
 
                         # OCR + geometry pipeline (with per-page error handling)
                         try:
-                            ocrpage, page_timings, proc_result = _build_results_for_image(
-                                image, page=page_number, enhance=enhance, profile_name=profile_name,
+                            ocrpage, page_timings, proc_result, fallback_meta = _run_page_with_targeted_fallback(
+                                image,
+                                page=page_number,
+                                enhance=enhance,
+                                profile_name=profile_name,
+                                rendering_profile=rendering_profile,
                             )
                             for key in metrics:
                                 metrics[key] += page_timings.get(key, 0.0)
@@ -1027,10 +1407,103 @@ def extract_internal_ocr_document(
                                     "operations_applied": proc_result.operations_applied,
                                     "operations_skipped": proc_result.operations_skipped,
                                 }
+                            if fallback_meta:
+                                processing_meta["targeted_fallback"] = fallback_meta
                             # Add rendering metadata
                             ocrpage.page_metrics["rendering_profile"] = rendering_profile
                             ocrpage.page_metrics["render_scale"] = round(page_scale, 2)
                             ocrpage.page_metrics["render_dpi"] = round(page_scale * 72, 1)
+
+                            # ── Collect preprocessing diagnostics ───────
+                            if SETTINGS.ocr_debug_diagnostics and proc_result:
+                                steps_detail: list[dict[str, str]] = []
+                                for step in (proc_result.operations_applied or []):
+                                    steps_detail.append({"name": step, "status": "applied"})
+                                for skip_info in (proc_result.operations_skipped or []):
+                                    steps_detail.append({
+                                        "name": skip_info.get("operation", "unknown"),
+                                        "status": "skipped",
+                                        "reason": skip_info.get("reason", "unknown"),
+                                    })
+                                page_diag["preprocessing"] = {
+                                    "requested": enhance,
+                                    "applied": proc_result.profile != "none",
+                                    "profile": proc_result.profile,
+                                    "steps": steps_detail,
+                                    "input_width": int(rw_render),
+                                    "input_height": int(rh_render),
+                                    "output_width": int(ocrpage.width),
+                                    "output_height": int(ocrpage.height),
+                                    "duration_ms": round(proc_result.duration_ms, 1),
+                                }
+                            elif SETTINGS.ocr_debug_diagnostics:
+                                page_diag["preprocessing"] = {
+                                    "requested": enhance,
+                                    "applied": False,
+                                    "profile": "none",
+                                    "steps": [],
+                                }
+
+                            # ── Collect Paddle diagnostics ──────────────
+                            if SETTINGS.ocr_debug_diagnostics:
+                                img_w = int(ocrpage.width)
+                                img_h = int(ocrpage.height)
+                                limit = SETTINGS.ocr_det_limit_side_len
+                                long_side = max(img_w, img_h)
+                                short_side = min(img_w, img_h)
+
+                                # Calculate Paddle's expected detector input dimensions
+                                # PaddleOCR det_limit_type="max" — resizes long side to det_limit_side_len
+                                if long_side <= limit:
+                                    resize_status = "not_required"
+                                    calc_w, calc_h = img_w, img_h
+                                    basis = f"long_side {long_side}px <= limit {limit}px"
+                                    note = "Image fits within detector limit; no resize"
+                                else:
+                                    resize_status = "expected"
+                                    calc_w = int(short_side * limit / long_side) if long_side > 0 else img_w
+                                    calc_h = limit
+                                    if img_w > img_h:
+                                        calc_w, calc_h = calc_h, calc_w
+                                    basis = f"long_side {long_side}px > limit {limit}px; resized proportionally"
+                                    note = (
+                                        f"PaddleOCR det_limit_type=max: long side clamped to {limit}px. "
+                                        f"Input {img_w}x{img_h} -> calculated detector input ~{calc_w}x{calc_h}px. "
+                                        f"Additional Paddle internal alignment/stride may adjust exact dimensions."
+                                    )
+
+                                page_diag["paddle"] = {
+                                    "paddleocr_version": engine_diag.get("paddleocr_version", "unavailable"),
+                                    "paddle_version": engine_diag.get("paddle_version", "unavailable"),
+                                    "detection_model": engine_diag.get("detection_model", "unavailable"),
+                                    "recognition_model": engine_diag.get("recognition_model", "unavailable"),
+                                    "device": engine_diag.get("device", "cpu"),
+                                    "paddle_device": engine_diag.get("paddle_device", "unavailable"),
+                                    "paddle_compiled_with_cuda": engine_diag.get("paddle_compiled_with_cuda", False),
+                                    "det_limit_side_len": limit,
+                                    "det_limit_type": "max",
+                                    "ocr_lang": SETTINGS.ocr_lang,
+                                    "cpu_threads": SETTINGS.ocr_cpu_threads,
+                                    "mkldnn": SETTINGS.ocr_enable_mkldnn,
+                                    "use_angle_cls": False,
+                                    "use_dilation": True,
+                                    "recognition_batch_size": SETTINGS.ocr_text_batch_size,
+                                    "input_width": img_w,
+                                    "input_height": img_h,
+                                    "detector_resize_status": resize_status,
+                                    "calculated_detector_width": calc_w,
+                                    "calculated_detector_height": calc_h,
+                                    "calculation_basis": basis,
+                                    "detector_resize_note": note,
+                                }
+                                page_diag["geometry"] = {
+                                    "geometry_provider": "paddleocr",
+                                    "text_provider": "paddleocr",
+                                    "ocr_pass": "baseline",
+                                    "render_profile": rendering_profile,
+                                }
+                                debug_pages.append(page_diag)
+
                             pages_data.append(ocrpage)
 
                             # Cache page immediately
@@ -1063,8 +1536,12 @@ def extract_internal_ocr_document(
                     if image is None:
                         raise ValueError("Invalid image")
                     try:
-                        ocrpage, page_timings, proc_result = _build_results_for_image(
-                            image, page=1, enhance=enhance, profile_name=profile_name,
+                        ocrpage, page_timings, proc_result, fallback_meta = _run_page_with_targeted_fallback(
+                            image,
+                            page=1,
+                            enhance=enhance,
+                            profile_name=profile_name,
+                            rendering_profile="standard",
                         )
                         for key in metrics:
                             metrics[key] = page_timings.get(key, 0.0)
@@ -1073,6 +1550,8 @@ def extract_internal_ocr_document(
                                 "operations_applied": proc_result.operations_applied,
                                 "operations_skipped": proc_result.operations_skipped,
                             }
+                        if fallback_meta:
+                            processing_meta["targeted_fallback"] = fallback_meta
                         ocrpage.page_metrics["rendering_profile"] = "standard"
                         ocrpage.page_metrics["render_scale"] = round(img_scale, 2)
                         ocrpage.page_metrics["render_dpi"] = round(img_scale * 72, 1)
@@ -1101,6 +1580,11 @@ def extract_internal_ocr_document(
         pages_data=pages_data, filename=filename, file_type=file_type,
         total_pages=page_count, selected_pages=selected_pages,
         total_duration_ms=total_duration_ms, metrics=metrics,
+        debug_diagnostics={
+            "enabled": True,
+            "engine": engine_diag,
+            "pages": debug_pages,
+        } if SETTINGS.ocr_debug_diagnostics and debug_pages else None,
     )
 
     response["processing"] = {
