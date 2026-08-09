@@ -1,0 +1,134 @@
+{
+  "version": 2,
+  "description": "OCR Engine quality benchmark corpus — Phase 2 diagnostics scaffolding (Session 1 checkpoint)",
+  "documents": [
+    {
+      "id": "madera",
+      "file": "resources/Sale_Deed_MADERA_SRINIVASULU.pdf",
+      "cases": [
+        {
+          "id": "madera-first-party",
+          "page": 1,
+          "expected_contains": ["MOHD", "OSMAN"],
+          "description": "First party / vendor identification on page 1"
+        },
+        {
+          "id": "madera-party",
+          "page": 2,
+          "expected_contains": ["M. ALIVELU", "M. SRINIVASULU"],
+          "description": "Vendee party names (M. ALIVELU, M. SRINIVASULU)"
+        },
+        {
+          "id": "madera-boundaries",
+          "page": 8,
+          "expected_contains": ["NORTH", "SOUTH", "EAST", "WEST", "H.No.3-71", "20", "Road"],
+          "description": "Schedule boundary block with EAST H.No.3-71 and WEST 20' wide Road"
+        },
+        {
+          "id": "madera-consideration",
+          "page": 3,
+          "expected_contains": ["WHEREAS", "Sq."],
+          "description": "Consideration / recital section"
+        }
+      ]
+    },
+    {
+      "id": "rajkumar",
+      "file": "resources/Sale_Deed_RajKumar_Anthony.pdf",
+      "cases": [
+        {
+          "id": "rajkumar-party",
+          "page": 1,
+          "expected_contains": ["RAJ KUMAR", "ANTHONY"],
+          "description": "Vendor party names with RAJ KUMAR ANTHONY"
+        },
+        {
+          "id": "rajkumar-built-up-area",
+          "page": 7,
+          "expected_contains": ["Total Built up area", "Ground Floor", "1100 Sft."],
+          "description": "Built-up area section: Total Built up area / Ground Floor 1100 Sft."
+        },
+        {
+          "id": "rajkumar-schedule",
+          "page": 5,
+          "expected_contains": ["schedule", "property", "NORTH", "PLOT NO.264"],
+          "description": "Schedule section with boundaries"
+        }
+      ]
+    }
+  ],
+  "configurations": [
+    {
+      "id": "A_baseline",
+      "description": "A: 100.8 DPI + det_limit 1536 + preprocessing none",
+      "render_scale": 1.4,
+      "det_limit_side_len": 1536,
+      "image_processing": false,
+      "image_processing_profile": "none",
+      "enhance": false
+    },
+    {
+      "id": "B_200dpi_1536limit",
+      "description": "B: 200 DPI + det_limit 1536 + preprocessing none",
+      "render_scale": 2.78,
+      "det_limit_side_len": 1536,
+      "image_processing": false,
+      "image_processing_profile": "none",
+      "enhance": false
+    },
+    {
+      "id": "C_200dpi_2048limit",
+      "description": "C: 200 DPI + det_limit 2048 + preprocessing none",
+      "render_scale": 2.78,
+      "det_limit_side_len": 2048,
+      "image_processing": false,
+      "image_processing_profile": "none",
+      "enhance": false
+    },
+    {
+      "id": "D_250dpi_1536limit",
+      "description": "D: 250 DPI + det_limit 1536 + preprocessing none",
+      "render_scale": 3.47,
+      "det_limit_side_len": 1536,
+      "image_processing": false,
+      "image_processing_profile": "none",
+      "enhance": false
+    },
+    {
+      "id": "E_250dpi_2048limit",
+      "description": "E: 250 DPI + det_limit 2048 + preprocessing none",
+      "render_scale": 3.47,
+      "det_limit_side_len": 2048,
+      "image_processing": false,
+      "image_processing_profile": "none",
+      "enhance": false
+    },
+    {
+      "id": "F_300dpi_1536limit",
+      "description": "F: 300 DPI + det_limit 1536 + preprocessing none",
+      "render_scale": 4.17,
+      "det_limit_side_len": 1536,
+      "image_processing": false,
+      "image_processing_profile": "none",
+      "enhance": false
+    },
+    {
+      "id": "G_300dpi_3000limit",
+      "description": "G: 300 DPI + det_limit 3000 + preprocessing none",
+      "render_scale": 4.17,
+      "det_limit_side_len": 3000,
+      "image_processing": false,
+      "image_processing_profile": "none",
+      "enhance": false
+    },
+    {
+      "id": "H_baseline_enhanced",
+      "description": "H: 100.8 DPI + det_limit 1536 + document_standard preprocessing",
+      "render_scale": 1.4,
+      "det_limit_side_len": 1536,
+      "image_processing": true,
+      "image_processing_profile": "document_standard",
+      "enhance": true
+    }
+  ]
+}

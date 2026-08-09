@@ -1,4 +1,4 @@
-.PHONY: help config build up down restart logs ps health test-deploy deploy test compile validate
+.PHONY: help config build up down restart logs ps health test-deploy deploy test compile validate benchmark-fast benchmark-recog benchmark-clean
 
 SHELL := /bin/bash
 .SHELLFLAGS := -Eeuo pipefail -c
@@ -14,23 +14,27 @@ PYTHON ?= py -3
 PYCACHE ?= /tmp/dokstract-ocr-engine-pycache
 WAIT_TIMEOUT_SECONDS ?= 180
 WAIT_INTERVAL_SECONDS ?= 5
+BENCHMARK_CASE ?=
 
 help:
 	@printf '%s\n' \
 		'Available targets:' \
-		'  make config      - validate the compose file and env file' \
-		'  make build       - build the OCR Engine image' \
-		'  make up          - start the OCR Engine compose service' \
-		'  make down        - stop the OCR Engine compose service' \
-		'  make restart     - restart the OCR Engine compose service' \
-		'  make logs        - follow OCR Engine logs' \
-		'  make ps          - show OCR Engine status' \
-		'  make health      - wait for OCR Engine health' \
-		'  make deploy      - validate, build, deploy, and wait for health' \
-		'  make test-deploy - alias for deploy' \
-		'  make test        - run the unit test suite' \
-		'  make compile     - syntax-check the Python sources' \
-		'  make validate    - run compile and tests'
+		'  make config           - validate the compose file and env file' \
+		'  make build            - build the OCR Engine image' \
+		'  make up               - start the OCR Engine compose service' \
+		'  make down             - stop the OCR Engine compose service' \
+		'  make restart          - restart the OCR Engine compose service' \
+		'  make logs             - follow OCR Engine logs' \
+		'  make ps               - show OCR Engine status' \
+		'  make health           - wait for OCR Engine health' \
+		'  make deploy           - validate, build, deploy, and wait for health' \
+		'  make test-deploy      - alias for deploy' \
+		'  make test             - run the unit test suite' \
+		'  make compile          - syntax-check the Python sources' \
+		'  make validate         - run compile and tests' \
+		'  make benchmark-fast   - fast production OCR validation [CASE=case-id]' \
+		'  make benchmark-recog  - recognition investigation with crop variants [CASE=case-id]' \
+		'  make benchmark-clean  - remove benchmark artifacts'
 
 config:
 	$(DOCKER_COMPOSE) config
@@ -106,3 +110,12 @@ compile:
 		tests/test_api.py
 
 validate: compile test
+
+benchmark-fast:
+	$(PYTHON) tools/ocr_benchmark.py fast $(if $(BENCHMARK_CASE),--case $(BENCHMARK_CASE),)
+
+benchmark-recog:
+	$(PYTHON) tools/ocr_benchmark.py recog $(if $(BENCHMARK_CASE),--case $(BENCHMARK_CASE),)
+
+benchmark-clean:
+	rm -rf artifacts/ocr-benchmarks/*
