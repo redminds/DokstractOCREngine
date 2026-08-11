@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from app.services.ocr.models import BBox, OCRItem
-from app.services.ocr.line_reconstruction import reconstruct_lines
+from app.services.ocr.line_reconstruction import reconstruct_lines, _sync_item_line_ids
 
 
 def _item(item_id: str, page: int, x1: float, y1: float, x2: float, y2: float, text: str = "x", confidence: float = 0.9) -> OCRItem:
@@ -152,6 +152,34 @@ class TestReconstructLines:
 
         assert items[0].line_id == "p1_l0"
         assert items[1].line_id == "p1_l0"
+
+    def test_rebuilt_line_assignment_overwrites_stale_ids(self):
+        items = [
+            _item("p1_i0", 1, 10, 10, 50, 30, "Hello"),
+            _item("p1_i1", 1, 60, 10, 110, 30, "World"),
+        ]
+        items[0].line_id = "stale"
+        items[1].line_id = "stale"
+
+        lines = reconstruct_lines(items, page_width=200, page_height=100)
+
+        assert lines[0].line_id == "p1_l0"
+        assert items[0].line_id == "p1_l0"
+        assert items[1].line_id == "p1_l0"
+
+    def test_filtered_line_reference_is_cleared(self):
+        items = [
+            _item("p1_i0", 1, 10, 10, 50, 30, "First"),
+            _item("p1_i1", 1, 10, 90, 50, 110, "Second"),
+        ]
+        lines = reconstruct_lines(items, page_width=200, page_height=200)
+        items[0].line_id = "deleted"
+        items[1].line_id = "deleted"
+
+        _sync_item_line_ids(items, lines[1:])
+
+        assert items[0].line_id is None
+        assert items[1].line_id == "p1_l1"
 
     def test_multi_column(self):
         """Items in different columns but same y should still group by vertical overlap."""

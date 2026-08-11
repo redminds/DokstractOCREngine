@@ -21,6 +21,23 @@ _DEFAULT_OVERLAP_THRESHOLD = 0.4
 _DEFAULT_MEDIAN_HEIGHT_FALLBACK = 20.0
 
 
+def _sync_item_line_ids(items: list[OCRItem], lines: list[OCRLine]) -> None:
+    """Synchronize item.line_id values with the surviving reconstructed lines.
+
+    This is used after any line-rebuild step that can replace or remove lines.
+    Items whose surviving line cannot be found are cleared rather than left
+    pointing at a deleted line id.
+    """
+    line_ids_by_item_id: dict[str, str] = {}
+    for line in lines:
+        for item_id in line.item_ids:
+            line_ids_by_item_id[item_id] = line.line_id
+
+    for item in items:
+        new_id = line_ids_by_item_id.get(item.item_id)
+        item.line_id = new_id
+
+
 def reconstruct_lines(
     items: list[OCRItem],
     page_width: float,
@@ -122,6 +139,8 @@ def reconstruct_lines(
         # Back-link: assign line_id to each item
         for it in group:
             it.line_id = line.line_id
+
+    _sync_item_line_ids(items, lines)
 
     logger.debug(
         "Reconstructed %d lines from %d items (overlap_threshold=%.2f, median_height=%.1f)",

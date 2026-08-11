@@ -19,6 +19,7 @@ def build_response(
     selected_pages: list[int],
     total_duration_ms: float = 0.0,
     metrics: dict[str, float] | None = None,
+    debug_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the canonical OCR API response dict.
 
@@ -156,6 +157,7 @@ def build_response(
             "items": items_out,
             "lines": lines_out,
             "blocks": blocks_out,
+            **({"table_meta": page.table_meta} if page.table_meta else {}),
         })
 
     # ── Metrics ──────────────────────────────────────────────────────────
@@ -176,4 +178,5 @@ def build_response(
         "document": document,
         "pages": pages_out,
         "metrics": {k: round(v, 3) if isinstance(v, float) else v for k, v in metrics_out.items()},
+        **({"_debug": debug_diagnostics} if debug_diagnostics else {}),
     }

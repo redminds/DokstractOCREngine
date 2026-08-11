@@ -94,3 +94,4 @@ class OCRPage:
     confidence: float = 0.0  # 0.0 – 1.0
     duration_ms: float = 0.0  # geometry-only time (backward compat; prefer metrics)
     page_metrics: dict[str, float] = field(default_factory=dict)
+    table_meta: dict | None = None  # structured table metadata from table_reconstruction
