@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 from pathlib import Path
@@ -77,6 +78,41 @@ def test_internal_extract_rejects_invalid_project_key(monkeypatch):
 
     assert response.status_code == 403
     assert response.json()["detail"] == "OCR engine internal OCR access is restricted to project_key='ocr'."
+
+
+def test_internal_extract_accepts_teaching_agent_identity(monkeypatch):
+    monkeypatch.setattr("app.main.engine_service", make_service())
+    monkeypatch.setattr(
+        "app.core.security.SETTINGS",
+        SimpleNamespace(
+            ocr_api_token="ocr-api-token",
+            schema_api_token="schema-api-token",
+            teaching_ocr_engine_token="teaching-agent-token",
+        ),
+    )
+    monkeypatch.setattr(
+        "app.core.ocr_execution.extract_internal_ocr_document",
+        lambda **kwargs: {
+            "file": {"name": "sample.txt", "type": "txt"},
+            "document": {"total_pages": 1, "processed_pages": [1], "text": "hello", "confidence": 0.99},
+            "pages": [],
+            "metrics": {},
+        },
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/internal/ocr/extract",
+        headers={
+            "X-Service-Name": "teaching-agent",
+            "X-Service-Token": "teaching-agent-token",
+        },
+        files={"file": ("sample.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        data={"project_key": "ocr", "api_version": "v1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["document"]["text"] == "hello"
 
 
 def test_ocr_concurrency_limit_queues_requests(monkeypatch):

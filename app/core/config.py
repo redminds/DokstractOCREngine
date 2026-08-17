@@ -18,6 +18,7 @@ class EngineSettings:
     port: int = int(os.getenv("ENGINE_PORT", "8010"))
     ocr_api_token: str = os.getenv("OCR_ENGINE_OCR_API_TOKEN", "change-me-ocr-api-to-engine").strip()
     schema_api_token: str = os.getenv("OCR_ENGINE_SCHEMA_API_TOKEN", "change-me-schema-api-to-engine").strip()
+    teaching_ocr_engine_token: str = os.getenv("TEACHING_OCR_ENGINE_TOKEN", "").strip()
     admin_token: str = os.getenv("ENGINE_ADMIN_TOKEN", "change-me-admin").strip()
     registry_db_path: str = os.getenv("ENGINE_REGISTRY_DB_PATH", "workspace_tmp/ocr-engine-registry.db").strip()
     default_release_tag: str = os.getenv("ENGINE_DEFAULT_RELEASE_TAG", "ocr-engine-2026.07.15").strip()
@@ -117,6 +118,8 @@ def validate_startup_configuration() -> None:
             raise RuntimeError("OCR_ENGINE_OCR_API_TOKEN must be configured in production.")
         if SETTINGS.schema_api_token in {"change-me-schema-api-to-engine", "change-me", "changeme"}:
             raise RuntimeError("OCR_ENGINE_SCHEMA_API_TOKEN must be configured in production.")
+        if SETTINGS.teaching_ocr_engine_token in {"change-me-teaching-agent-to-engine", "change-me", "changeme", ""}:
+            raise RuntimeError("TEACHING_OCR_ENGINE_TOKEN must be configured in production.")
         if SETTINGS.admin_token in {"change-me-admin", "change-me", "changeme"}:
             raise RuntimeError("ENGINE_ADMIN_TOKEN must be configured in production.")
     if SETTINGS.ocr_max_image_width_pixels <= 0:

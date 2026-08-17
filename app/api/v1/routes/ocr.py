@@ -18,9 +18,9 @@ from app.core.service import OCREngineService
 logger = logging.getLogger("dokstract.ocr_engine.routes")
 router = APIRouter(prefix="/api/v1/internal/ocr", tags=["ocr"])
 _OCR_CONCURRENCY_SEMAPHORE = asyncio.Semaphore(max(1, SETTINGS.ocr_max_concurrency))
-_AUTHORIZED_PROJECT_KEYS = {"ocr-api": "ocr", "schema-api": "schema"}
+_AUTHORIZED_PROJECT_KEYS = {"ocr-api": "ocr", "schema-api": "schema", "teaching-agent": "ocr"}
 _ROUTE_ALLOWLIST = {
-    "extract": {"ocr-api", "schema-api"},
+    "extract": {"ocr-api", "schema-api", "teaching-agent"},
     "auto": {"schema-api"},
 }
 
