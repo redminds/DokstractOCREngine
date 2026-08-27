@@ -13,13 +13,16 @@ from app.api.v1.routes.admin import router as admin_router
 from app.api.v1.routes.engine import router as engine_router
 from app.api.v1.routes.ocr import router as ocr_router
 from app.core.config import SETTINGS, validate_startup_configuration
+from app.core.observability import setup_metrics_endpoint
 from app.core.registry import EngineRegistry
 from app.core.service import OCREngineService
+from app.services.execution_outbox import OCREngineExecutionOutboxService
 
 logger = logging.getLogger("dokstract.ocr_engine")
 
 registry = EngineRegistry(SETTINGS.registry_path)
 engine_service = OCREngineService(registry=registry)
+execution_outbox_service = OCREngineExecutionOutboxService(registry=registry)
 
 
 @asynccontextmanager
@@ -40,7 +43,9 @@ async def lifespan(app: FastAPI):
         raise
     # Initialize cache directory
     await run_in_threadpool(_init_cache_dir)
+    await execution_outbox_service.start()
     yield
+    await execution_outbox_service.stop()
     logger.info("Stopping OCR Engine Service")
 
 
@@ -74,6 +79,8 @@ app = FastAPI(
     openapi_url="/openapi.json" if SETTINGS.app_env == "development" else None,
 )
 
+setup_metrics_endpoint(app)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(SETTINGS.allow_origins),
@@ -90,6 +97,7 @@ app.include_router(admin_router)
 @app.get("/health")
 def health():
     active = engine_service.snapshot().get("active_release")
+    reporting = execution_outbox_service.snapshot()
     return {
         "status": "ok",
         "service": SETTINGS.service_name,
@@ -97,6 +105,13 @@ def health():
         "image_digest": active["image_digest"] if active else None,
         "supported_api_versions": active["supported_api_versions"] if active else [],
         "capabilities": active["capabilities"] if active else [],
+        "reporting": {
+            "enabled": execution_outbox_service.is_enabled(),
+            "pending": reporting.get("pending", 0),
+            "retry": reporting.get("retry", 0),
+            "dead_letter": reporting.get("dead_letter", 0),
+            "last_successful_delivery_at": reporting.get("last_successful_delivery_at"),
+        },
     }
 
 
@@ -113,6 +128,7 @@ def health_live():
 @app.get("/health/ready")
 def health_ready():
     active = engine_service.snapshot().get("active_release")
+    reporting = execution_outbox_service.snapshot()
     return {
         "status": "ok" if active and active.get("health_state") == "healthy" and active.get("readiness_state") == "ready" else "degraded",
         "service": SETTINGS.service_name,
@@ -122,6 +138,13 @@ def health_ready():
         "image_digest": active["image_digest"] if active else None,
         "supported_api_versions": active["supported_api_versions"] if active else [],
         "capabilities": active["capabilities"] if active else [],
+        "reporting": {
+            "enabled": execution_outbox_service.is_enabled(),
+            "pending": reporting.get("pending", 0),
+            "retry": reporting.get("retry", 0),
+            "dead_letter": reporting.get("dead_letter", 0),
+            "last_successful_delivery_at": reporting.get("last_successful_delivery_at"),
+        },
     }
 
 

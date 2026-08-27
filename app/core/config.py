@@ -16,9 +16,32 @@ class EngineSettings:
     service_name: str = os.getenv("ENGINE_SERVICE_NAME", "dokstract-ocr-engine").strip()
     host: str = os.getenv("ENGINE_HOST", "0.0.0.0").strip()
     port: int = int(os.getenv("ENGINE_PORT", "8010"))
+    platform_api_url: str = os.getenv("PLATFORM_API_URL", "http://platform-api:8000").strip().rstrip("/")
     ocr_api_token: str = os.getenv("OCR_ENGINE_OCR_API_TOKEN", "change-me-ocr-api-to-engine").strip()
     schema_api_token: str = os.getenv("OCR_ENGINE_SCHEMA_API_TOKEN", "change-me-schema-api-to-engine").strip()
     teaching_ocr_engine_token: str = os.getenv("TEACHING_OCR_ENGINE_TOKEN", "").strip()
+    platform_api_ocr_engine_token: str = os.getenv("PLATFORM_API_OCR_ENGINE_TOKEN", "").strip()
+    platform_reporting_enabled: bool = os.getenv("PLATFORM_REPORTING_ENABLED", "true").strip().lower() == "true"
+    platform_reporting_request_timeout_seconds: float = float(
+        os.getenv("PLATFORM_REPORTING_REQUEST_TIMEOUT_SECONDS", "15")
+    )
+    platform_reporting_poll_interval_seconds: float = float(
+        os.getenv("PLATFORM_REPORTING_POLL_INTERVAL_SECONDS", "5")
+    )
+    platform_reporting_claim_timeout_seconds: float = float(
+        os.getenv("PLATFORM_REPORTING_CLAIM_TIMEOUT_SECONDS", "30")
+    )
+    platform_reporting_retry_base_delay_seconds: float = float(
+        os.getenv("PLATFORM_REPORTING_RETRY_BASE_DELAY_SECONDS", "5")
+    )
+    platform_reporting_retry_max_delay_seconds: float = float(
+        os.getenv("PLATFORM_REPORTING_RETRY_MAX_DELAY_SECONDS", "300")
+    )
+    platform_reporting_max_attempts: int = int(os.getenv("PLATFORM_REPORTING_MAX_ATTEMPTS", "8"))
+    platform_reporting_batch_size: int = int(os.getenv("PLATFORM_REPORTING_BATCH_SIZE", "20"))
+    platform_reporting_delivered_retention_seconds: int = int(
+        os.getenv("PLATFORM_REPORTING_DELIVERED_RETENTION_SECONDS", str(24 * 60 * 60))
+    )
     admin_token: str = os.getenv("ENGINE_ADMIN_TOKEN", "change-me-admin").strip()
     registry_db_path: str = os.getenv("ENGINE_REGISTRY_DB_PATH", "workspace_tmp/ocr-engine-registry.db").strip()
     default_release_tag: str = os.getenv("ENGINE_DEFAULT_RELEASE_TAG", "ocr-engine-2026.07.15").strip()
@@ -120,6 +143,10 @@ def validate_startup_configuration() -> None:
             raise RuntimeError("OCR_ENGINE_SCHEMA_API_TOKEN must be configured in production.")
         if SETTINGS.teaching_ocr_engine_token in {"change-me-teaching-agent-to-engine", "change-me", "changeme", ""}:
             raise RuntimeError("TEACHING_OCR_ENGINE_TOKEN must be configured in production.")
+        if not SETTINGS.platform_api_url:
+            raise RuntimeError("PLATFORM_API_URL must be configured in production.")
+    if SETTINGS.platform_api_ocr_engine_token in {"change-me", "changeme", ""}:
+        raise RuntimeError("PLATFORM_API_OCR_ENGINE_TOKEN must be configured in production.")
         if SETTINGS.admin_token in {"change-me-admin", "change-me", "changeme"}:
             raise RuntimeError("ENGINE_ADMIN_TOKEN must be configured in production.")
     if SETTINGS.ocr_max_image_width_pixels <= 0:
@@ -140,6 +167,22 @@ def validate_startup_configuration() -> None:
         raise RuntimeError("OCR_STITCHED_PAGE_CONFIDENCE_THRESHOLD must be between 0.0 and 1.0.")
     if SETTINGS.ocr_max_pdf_pages_per_request > SETTINGS.ocr_max_pdf_pages_per_file:
         raise RuntimeError("OCR_MAX_PDF_PAGES_PER_REQUEST must not exceed OCR_MAX_PDF_PAGES_PER_FILE.")
+    if SETTINGS.platform_reporting_request_timeout_seconds <= 0:
+        raise RuntimeError("PLATFORM_REPORTING_REQUEST_TIMEOUT_SECONDS must be positive.")
+    if SETTINGS.platform_reporting_poll_interval_seconds <= 0:
+        raise RuntimeError("PLATFORM_REPORTING_POLL_INTERVAL_SECONDS must be positive.")
+    if SETTINGS.platform_reporting_claim_timeout_seconds <= 0:
+        raise RuntimeError("PLATFORM_REPORTING_CLAIM_TIMEOUT_SECONDS must be positive.")
+    if SETTINGS.platform_reporting_retry_base_delay_seconds <= 0:
+        raise RuntimeError("PLATFORM_REPORTING_RETRY_BASE_DELAY_SECONDS must be positive.")
+    if SETTINGS.platform_reporting_retry_max_delay_seconds < SETTINGS.platform_reporting_retry_base_delay_seconds:
+        raise RuntimeError("PLATFORM_REPORTING_RETRY_MAX_DELAY_SECONDS must not be smaller than the base delay.")
+    if SETTINGS.platform_reporting_max_attempts <= 0:
+        raise RuntimeError("PLATFORM_REPORTING_MAX_ATTEMPTS must be positive.")
+    if SETTINGS.platform_reporting_batch_size <= 0:
+        raise RuntimeError("PLATFORM_REPORTING_BATCH_SIZE must be positive.")
+    if SETTINGS.platform_reporting_delivered_retention_seconds <= 0:
+        raise RuntimeError("PLATFORM_REPORTING_DELIVERED_RETENTION_SECONDS must be positive.")
     # Temp lifecycle
     if SETTINGS.ocr_temp_stale_after_seconds <= 0:
         raise RuntimeError("OCR_TEMP_STALE_AFTER_SECONDS must be positive.")
