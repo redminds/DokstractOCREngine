@@ -68,6 +68,25 @@ class AuditEvent:
     created_at: str
 
 
+@dataclass(frozen=True)
+class OCREngineExecutionOutboxRecord:
+    event_id: str
+    payload_json: str
+    status: str
+    attempt_count: int
+    created_at: str
+    updated_at: str
+    last_attempt_at: str | None
+    next_attempt_at: str | None
+    delivered_at: str | None
+    last_error: str | None
+    last_error_category: str | None
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        return json.loads(self.payload_json)
+
+
 class EngineRegistry:
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
@@ -164,6 +183,23 @@ class EngineRegistry:
                     actor_id TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS ocr_execution_outbox (
+                    event_id TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_attempt_at TEXT,
+                    next_attempt_at TEXT NOT NULL,
+                    delivered_at TEXT,
+                    last_error TEXT,
+                    last_error_category TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_ocr_execution_outbox_status_next_attempt
+                    ON ocr_execution_outbox (status, next_attempt_at);
+                CREATE INDEX IF NOT EXISTS idx_ocr_execution_outbox_status_created
+                    ON ocr_execution_outbox (status, created_at);
                 """
             )
             for table_name in ("project_dependencies", "dependency_requests"):
@@ -189,6 +225,194 @@ class EngineRegistry:
                     (default_release.release_tag, None, now),
                 )
             conn.commit()
+
+    def enqueue_ocr_execution_outbox_event(self, payload: dict[str, Any]) -> OCREngineExecutionOutboxRecord:
+        event_id = str(payload.get("event_id") or "").strip()
+        if not event_id:
+            raise ValueError("OCR execution event_id is required.")
+        payload_json = _dump_json(payload)
+        now = _utc_now()
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO ocr_execution_outbox (
+                    event_id, payload_json, status, attempt_count,
+                    created_at, updated_at, last_attempt_at, next_attempt_at,
+                    delivered_at, last_error, last_error_category
+                ) VALUES (?, ?, 'pending', 0, ?, ?, NULL, ?, NULL, NULL, NULL)
+                """,
+                (
+                    event_id,
+                    payload_json,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM ocr_execution_outbox WHERE event_id = ?", (event_id,)).fetchone()
+            if not row:
+                raise RuntimeError("Failed to persist OCR execution outbox event.")
+            return self._row_to_outbox_record(row)
+
+    def claim_due_ocr_execution_outbox_events(
+        self,
+        *,
+        limit: int,
+        claim_timeout_seconds: float,
+    ) -> list[OCREngineExecutionOutboxRecord]:
+        now = _utc_now()
+        claimed: list[OCREngineExecutionOutboxRecord] = []
+        next_attempt_at = self._offset_iso_seconds(claim_timeout_seconds)
+        with self._lock, self._connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM ocr_execution_outbox
+                WHERE status IN ('pending', 'retry')
+                  AND next_attempt_at <= ?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (now, max(1, min(int(limit), 100))),
+            ).fetchall() or []
+            for row in rows:
+                row_data = dict(row)
+                event_id = str(row_data.get("event_id") or "").strip()
+                if not event_id:
+                    continue
+                cur = conn.execute(
+                    """
+                    UPDATE ocr_execution_outbox
+                    SET status = 'retry',
+                        attempt_count = attempt_count + 1,
+                        last_attempt_at = ?,
+                        next_attempt_at = ?,
+                        updated_at = ?
+                    WHERE event_id = ?
+                      AND status IN ('pending', 'retry')
+                      AND next_attempt_at <= ?
+                    """,
+                    (now, next_attempt_at, now, event_id, now),
+                )
+                if cur.rowcount <= 0:
+                    continue
+                refreshed = conn.execute("SELECT * FROM ocr_execution_outbox WHERE event_id = ?", (event_id,)).fetchone()
+                if refreshed:
+                    claimed.append(self._row_to_outbox_record(refreshed))
+            conn.commit()
+        return claimed
+
+    def mark_ocr_execution_outbox_delivered(self, *, event_id: str, delivered_at: str | None = None) -> None:
+        now = delivered_at or _utc_now()
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE ocr_execution_outbox
+                SET status = 'delivered',
+                    delivered_at = ?,
+                    updated_at = ?,
+                    last_error = NULL,
+                    last_error_category = NULL,
+                    next_attempt_at = ?
+                WHERE event_id = ?
+                """,
+                (now, now, now, event_id),
+            )
+            conn.commit()
+
+    def retry_ocr_execution_outbox_event(
+        self,
+        *,
+        event_id: str,
+        last_error: str,
+        last_error_category: str,
+        next_attempt_at: str,
+    ) -> None:
+        now = _utc_now()
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE ocr_execution_outbox
+                SET status = 'retry',
+                    updated_at = ?,
+                    last_error = ?,
+                    last_error_category = ?,
+                    next_attempt_at = ?
+                WHERE event_id = ?
+                """,
+                (now, last_error, last_error_category, next_attempt_at, event_id),
+            )
+            conn.commit()
+
+    def dead_letter_ocr_execution_outbox_event(
+        self,
+        *,
+        event_id: str,
+        last_error: str,
+        last_error_category: str,
+    ) -> None:
+        now = _utc_now()
+        with self._lock, self._connection() as conn:
+            conn.execute(
+                """
+                UPDATE ocr_execution_outbox
+                SET status = 'dead_letter',
+                    updated_at = ?,
+                    last_error = ?,
+                    last_error_category = ?,
+                    next_attempt_at = ?
+                WHERE event_id = ?
+                """,
+                (now, last_error, last_error_category, now, event_id),
+            )
+            conn.commit()
+
+    def cleanup_delivered_ocr_execution_outbox_events(self, *, delivered_retention_seconds: int) -> int:
+        cutoff = self._offset_iso_seconds(-abs(int(delivered_retention_seconds)))
+        with self._lock, self._connection() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM ocr_execution_outbox
+                WHERE status = 'delivered'
+                  AND delivered_at IS NOT NULL
+                  AND delivered_at <= ?
+                """,
+                (cutoff,),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+
+    def get_ocr_execution_outbox_stats(self) -> dict[str, Any]:
+        try:
+            with self._connection() as conn:
+                row = conn.execute(
+                    """
+                    SELECT
+                        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending,
+                        SUM(CASE WHEN status = 'retry' THEN 1 ELSE 0 END) AS retry,
+                        SUM(CASE WHEN status = 'dead_letter' THEN 1 ELSE 0 END) AS dead_letter,
+                        MIN(CASE WHEN status IN ('pending', 'retry') THEN next_attempt_at END) AS oldest_due_at,
+                        MAX(CASE WHEN status = 'delivered' THEN delivered_at END) AS last_successful_delivery_at
+                    FROM ocr_execution_outbox
+                    """
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            row = None
+        rows = dict(row) if row is not None else {}
+        oldest_due_at = rows.get("oldest_due_at")
+        oldest_pending_age_seconds = None
+        if oldest_due_at:
+            oldest_pending_age_seconds = self._iso_age_seconds(str(oldest_due_at))
+        return {
+            "pending": int(rows.get("pending") or 0),
+            "retry": int(rows.get("retry") or 0),
+            "dead_letter": int(rows.get("dead_letter") or 0),
+            "oldest_pending_age_seconds": oldest_pending_age_seconds,
+            "last_successful_delivery_at": rows.get("last_successful_delivery_at"),
+        }
 
     def _upsert_release(
         self,
@@ -764,6 +988,34 @@ class EngineRegistry:
             "promoted_at": row["promoted_at"],
             "previous_release_tag": row["previous_release_tag"],
         }
+
+    def _row_to_outbox_record(self, row: sqlite3.Row | dict[str, Any]) -> OCREngineExecutionOutboxRecord:
+        row_data = dict(row) if not isinstance(row, dict) else row
+        return OCREngineExecutionOutboxRecord(
+            event_id=str(row_data["event_id"]),
+            payload_json=str(row_data["payload_json"]),
+            status=str(row_data["status"]),
+            attempt_count=int(row_data["attempt_count"] or 0),
+            created_at=str(row_data["created_at"]),
+            updated_at=str(row_data["updated_at"]),
+            last_attempt_at=row_data.get("last_attempt_at"),
+            next_attempt_at=row_data.get("next_attempt_at"),
+            delivered_at=row_data.get("delivered_at"),
+            last_error=row_data.get("last_error"),
+            last_error_category=row_data.get("last_error_category"),
+        )
+
+    @staticmethod
+    def _offset_iso_seconds(seconds: float) -> str:
+        return datetime.fromtimestamp(datetime.now(timezone.utc).timestamp() + seconds, tz=timezone.utc).isoformat()
+
+    @staticmethod
+    def _iso_age_seconds(value: str) -> float | None:
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except Exception:
+            return None
+        return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
 
     def _audit(
         self,
