@@ -10,6 +10,7 @@ from app.core.config import SETTINGS
 _SERVICE_TOKENS = {
     "ocr-api": lambda: SETTINGS.ocr_api_token,
     "schema-api": lambda: SETTINGS.schema_api_token,
+    "teaching-agent": lambda: SETTINGS.teaching_ocr_engine_token,
 }
 
 

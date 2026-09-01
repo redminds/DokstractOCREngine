@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+from contextlib import asynccontextmanager
 
 from fastapi.testclient import TestClient
 from pathlib import Path
@@ -77,6 +79,190 @@ def test_internal_extract_rejects_invalid_project_key(monkeypatch):
 
     assert response.status_code == 403
     assert response.json()["detail"] == "OCR engine internal OCR access is restricted to project_key='ocr'."
+
+
+def test_internal_extract_accepts_teaching_agent_identity(monkeypatch):
+    monkeypatch.setattr("app.main.engine_service", make_service())
+    monkeypatch.setattr(
+        "app.core.security.SETTINGS",
+        SimpleNamespace(
+            ocr_api_token="ocr-api-token",
+            schema_api_token="schema-api-token",
+            teaching_ocr_engine_token="teaching-agent-token",
+        ),
+    )
+    monkeypatch.setattr(
+        "app.core.ocr_execution.extract_internal_ocr_document",
+        lambda **kwargs: {
+            "file": {"name": "sample.txt", "type": "txt"},
+            "document": {"total_pages": 1, "processed_pages": [1], "text": "hello", "confidence": 0.99},
+            "pages": [],
+            "metrics": {},
+        },
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/internal/ocr/extract",
+        headers={
+            "X-Service-Name": "teaching-agent",
+            "X-Service-Token": "teaching-agent-token",
+        },
+        files={"file": ("sample.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        data={"project_key": "ocr", "api_version": "v1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["document"]["text"] == "hello"
+
+
+def test_internal_extract_reports_ocr_execution(monkeypatch):
+    monkeypatch.setattr("app.main.engine_service", make_service())
+    monkeypatch.setattr(
+        "app.core.security.SETTINGS",
+        SimpleNamespace(
+            ocr_api_token="ocr-api-token",
+            schema_api_token="schema-api-token",
+            teaching_ocr_engine_token="teaching-agent-token",
+        ),
+    )
+    monkeypatch.setattr(
+        "app.core.ocr_execution.extract_internal_ocr_document",
+        lambda **kwargs: {
+            "file": {"name": "sample.pdf", "type": "pdf"},
+            "document": {"total_pages": 1, "processed_pages": [1], "text": "hello", "confidence": 0.99},
+            "pages": [{"page_number": 1, "items": [{"text": "hello"}]}],
+            "metrics": {},
+        },
+    )
+
+    @asynccontextmanager
+    async def noop_slot():
+        yield
+
+    captured: dict[str, object] = {}
+
+    class DummyOutboxService:
+        async def enqueue(self, payload):
+            captured["payload"] = payload
+
+    monkeypatch.setattr("app.api.v1.routes.ocr._acquire_engine_request_slot", noop_slot)
+    monkeypatch.setattr("app.main.execution_outbox_service", DummyOutboxService())
+    async def fake_run_in_threadpool(fn, **kwargs):
+        return fn(**kwargs)
+
+    monkeypatch.setattr("app.api.v1.routes.ocr.run_in_threadpool", fake_run_in_threadpool)
+    monkeypatch.setattr(
+        "app.main.engine_service.request_dependency",
+        lambda **kwargs: SimpleNamespace(
+            allowed=True,
+            assigned_release={
+                "release_tag": "ocr-engine-2026.07.15",
+                "image_digest": "sha256:dev-placeholder",
+                "supported_api_versions": ["v1"],
+                "capabilities": ["ocr", "pdf"],
+            },
+            message="",
+            manual_intervention_required=False,
+            active_release=None,
+            compatible_release=None,
+            pending_request=None,
+            blocking_projects=[],
+        ),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/internal/ocr/extract",
+        headers={
+            "X-Service-Name": "ocr-api",
+            "X-Service-Token": "ocr-api-token",
+            "X-Request-ID": "req-123",
+            "X-Correlation-ID": "corr-123",
+            "X-Job-ID": "job-123",
+            "X-Client-ID": "client-123",
+            "X-Workspace-ID": "workspace-123",
+            "X-Document-ID": "document-123",
+        },
+        files={"file": ("sample.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        data={"project_key": "ocr", "api_version": "v1"},
+    )
+
+    assert response.status_code == 200
+    assert captured["payload"]["caller_service"] == "ocr-api"
+    assert captured["payload"]["operation"] == "extract"
+    assert captured["payload"]["page_count"] == 1
+    assert captured["payload"]["client_id"] == "client-123"
+    assert captured["payload"]["workspace_id"] == "workspace-123"
+    assert captured["payload"]["document_id"] == "document-123"
+
+
+def test_internal_extract_is_not_failed_by_outbox_persistence_failure(monkeypatch):
+    monkeypatch.setattr("app.main.engine_service", make_service())
+    monkeypatch.setattr(
+        "app.core.security.SETTINGS",
+        SimpleNamespace(
+            ocr_api_token="ocr-api-token",
+            schema_api_token="schema-api-token",
+            teaching_ocr_engine_token="teaching-agent-token",
+        ),
+    )
+    monkeypatch.setattr(
+        "app.core.ocr_execution.extract_internal_ocr_document",
+        lambda **kwargs: {
+            "file": {"name": "sample.pdf", "type": "pdf"},
+            "document": {"total_pages": 1, "processed_pages": [1], "text": "hello", "confidence": 0.99},
+            "pages": [{"page_number": 1, "items": [{"text": "hello"}]}],
+            "metrics": {},
+        },
+    )
+
+    @asynccontextmanager
+    async def noop_slot():
+        yield
+
+    class FailingOutboxService:
+        async def enqueue(self, payload):
+            raise RuntimeError("disk full")
+
+    monkeypatch.setattr("app.api.v1.routes.ocr._acquire_engine_request_slot", noop_slot)
+    monkeypatch.setattr("app.main.execution_outbox_service", FailingOutboxService())
+    async def fake_run_in_threadpool(fn, **kwargs):
+        return fn(**kwargs)
+
+    monkeypatch.setattr("app.api.v1.routes.ocr.run_in_threadpool", fake_run_in_threadpool)
+    monkeypatch.setattr(
+        "app.main.engine_service.request_dependency",
+        lambda **kwargs: SimpleNamespace(
+            allowed=True,
+            assigned_release={
+                "release_tag": "ocr-engine-2026.07.15",
+                "image_digest": "sha256:dev-placeholder",
+                "supported_api_versions": ["v1"],
+                "capabilities": ["ocr", "pdf"],
+            },
+            message="",
+            manual_intervention_required=False,
+            active_release=None,
+            compatible_release=None,
+            pending_request=None,
+            blocking_projects=[],
+        ),
+    )
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/internal/ocr/extract",
+        headers={
+            "X-Service-Name": "ocr-api",
+            "X-Service-Token": "ocr-api-token",
+        },
+        files={"file": ("sample.pdf", b"%PDF-1.4 fake", "application/pdf")},
+        data={"project_key": "ocr", "api_version": "v1"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["document"]["text"] == "hello"
 
 
 def test_ocr_concurrency_limit_queues_requests(monkeypatch):
