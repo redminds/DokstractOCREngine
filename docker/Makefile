@@ -31,7 +31,7 @@ REPO_ROOT := $(abspath $(MAKEFILE_DIR)/..)
 # Jenkins can override ENV_FILE with an absolute server-managed path:
 #
 #   make -C docker \
-#     ENV_FILE=/etc/dokstract/dev/DokstractOCREngine/.env \
+#     ENV_FILE=/etc/dokstract/<environment>/DokstractOCREngine/.env \
 #     deploy
 #
 ENV_FILE ?= .env
@@ -45,11 +45,6 @@ resolve_path = $(if $(filter /%,$(1)),$(1),$(abspath $(MAKEFILE_DIR)/$(1)))
 RESOLVED_ENV_FILE := $(call resolve_path,$(ENV_FILE))
 RESOLVED_COMPOSE_FILE := $(call resolve_path,$(COMPOSE_FILE))
 RESOLVED_SECONDARY_COMPOSE_FILE := $(call resolve_path,$(SECONDARY_COMPOSE_FILE))
-
-# Exporting this variable so the Compose file can use it for service
-# environment configuration if required.
-SERVICE_ENV_FILE ?= $(RESOLVED_ENV_FILE)
-export SERVICE_ENV_FILE
 
 # Ensure ${ENV_FILE} inside docker-compose.yml resolves to the authoritative
 # environment file path.
@@ -108,7 +103,7 @@ help:
 		'  make -C docker <target>' \
 		'' \
 		'Jenkins usage:' \
-		'  make -C docker ENV_FILE=/etc/dokstract/dev/DokstractOCREngine/.env deploy' \
+		'  make -C docker ENV_FILE=/etc/dokstract/<environment>/DokstractOCREngine/.env deploy' \
 		'' \
 		'Targets:' \
 		'  help         Show this help message' \
@@ -126,7 +121,7 @@ help:
 		'' \
 		'Optional secondary network:' \
 		'  OCR_ENGINE_ENABLE_SECONDARY_NETWORK=true' \
-		'  OCR_ENGINE_SECONDARY_NETWORK=dokstract-shared-test' \
+		'  OCR_ENGINE_SECONDARY_NETWORK=dokstract-shared-<environment>' \
 		'' \
 		'Resolved defaults:' \
 		'  Environment file:          $(RESOLVED_ENV_FILE)' \

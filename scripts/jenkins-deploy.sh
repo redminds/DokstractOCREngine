@@ -3,14 +3,15 @@
 set -eu
 
 APP_NAME="DokstractOCREngine"
+DEPLOY_ENV="${DEPLOY_ENV:-}"
 
 # Jenkins GitHub checkout directory.
 SOURCE_ROOT="$(pwd)"
 
 # Stable application and configuration locations.
-DEPLOY_ROOT="/opt/dokstract/dev/$APP_NAME"
-CONFIG_ROOT="/etc/dokstract/dev/$APP_NAME"
-ENV_FILE="$CONFIG_ROOT/.env"
+DEPLOY_ROOT="${DEPLOY_ROOT:-/opt/dokstract/$DEPLOY_ENV/$APP_NAME}"
+CONFIG_ROOT="${CONFIG_ROOT:-/etc/dokstract/$DEPLOY_ENV/$APP_NAME}"
+ENV_FILE="${ENV_FILE:-$CONFIG_ROOT/.env}"
 
 fail() {
   echo "ERROR: $*" >&2
@@ -20,6 +21,9 @@ fail() {
 log() {
   echo "[deploy] $*"
 }
+
+[ -n "$DEPLOY_ENV" ] \
+  || fail "DEPLOY_ENV must be set explicitly (for example: dev, test, or prod)"
 
 log "Source Root Path: $SOURCE_ROOT"
 

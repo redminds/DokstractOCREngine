@@ -3,97 +3,41 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -Eeuo pipefail -c
 
-REPO_ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
-DOCKER_DIR := $(REPO_ROOT)/docker
-COMPOSE_FILE ?= docker-compose.yml
+# Keep root commands aligned with the deployment-aware Docker Makefile.
 ENV_FILE ?= .env
-COMPOSE_PROJECT_NAME ?= dokstract-ocr-engine
+COMPOSE_FILE ?= docker-compose.yml
+SECONDARY_COMPOSE_FILE ?= docker-compose.secondary-network.yml
 COMPOSE_SERVICE ?= ocr-engine
-DOCKER_COMPOSE = docker compose --env-file "$(DOCKER_DIR)/$(ENV_FILE)" -p "$(COMPOSE_PROJECT_NAME)" -f "$(DOCKER_DIR)/$(COMPOSE_FILE)"
 PYTHON ?= py -3
 PYCACHE ?= /tmp/dokstract-ocr-engine-pycache
-WAIT_TIMEOUT_SECONDS ?= 180
-WAIT_INTERVAL_SECONDS ?= 5
 BENCHMARK_CASE ?=
 
 help:
 	@printf '%s\n' \
 		'Available targets:' \
-		'  make config           - validate the compose file and env file' \
-		'  make build            - build the OCR Engine image' \
-		'  make up               - start the OCR Engine compose service' \
-		'  make down             - stop the OCR Engine compose service' \
-		'  make restart          - restart the OCR Engine compose service' \
-		'  make logs             - follow OCR Engine logs' \
-		'  make ps               - show OCR Engine status' \
-		'  make health           - wait for OCR Engine health' \
-		'  make deploy           - validate, build, deploy, and wait for health' \
-		'  make test-deploy      - alias for deploy' \
-		'  make test             - run the unit test suite' \
-		'  make compile          - syntax-check the Python sources' \
-		'  make validate         - run compile and tests' \
-		'  make benchmark-fast   - fast production OCR validation [CASE=case-id]' \
-		'  make benchmark-recog  - recognition investigation with crop variants [CASE=case-id]' \
-		'  make benchmark-clean  - remove benchmark artifacts'
+		'  config             - validate and render Docker Compose' \
+		'  build              - build the OCR Engine image' \
+		'  up                 - start the OCR Engine compose service' \
+		'  down               - stop the OCR Engine compose service' \
+		'  restart            - restart the OCR Engine compose service' \
+		'  logs               - follow OCR Engine logs' \
+		'  ps                 - show OCR Engine status' \
+		'  health             - wait for OCR Engine health' \
+		'  deploy             - validate, build, deploy, and wait for health' \
+		'  test               - run the unit test suite' \
+		'  compile            - syntax-check the Python sources' \
+		'  validate           - run compile and tests' \
+		'  benchmark-fast     - fast production OCR validation' \
+		'  benchmark-recog    - recognition investigation with crop variants' \
+		'  benchmark-clean    - remove benchmark artifacts'
 
-config:
-	$(DOCKER_COMPOSE) config
-
-build:
-	$(DOCKER_COMPOSE) build $(COMPOSE_SERVICE)
-
-up:
-	$(DOCKER_COMPOSE) up -d --remove-orphans --no-build $(COMPOSE_SERVICE)
-
-down:
-	$(DOCKER_COMPOSE) down --remove-orphans
-
-restart:
-	$(DOCKER_COMPOSE) down --remove-orphans
-	$(DOCKER_COMPOSE) up -d --remove-orphans --no-build $(COMPOSE_SERVICE)
-
-logs:
-	$(DOCKER_COMPOSE) logs -f --tail 100 $(COMPOSE_SERVICE)
-
-ps:
-	$(DOCKER_COMPOSE) ps
-
-health:
-	@container_id="$$( $(DOCKER_COMPOSE) ps -q $(COMPOSE_SERVICE) )"; \
-	if [[ -z "$$container_id" ]]; then \
-		printf '%s\n' '[health] OCR Engine container is not running.' >&2; \
-		exit 1; \
-	fi; \
-	deadline=$$(( $$(date +%s) + $(WAIT_TIMEOUT_SECONDS) )); \
-	while :; do \
-		status="$$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$$container_id" 2>/dev/null || true)"; \
-		case "$$status" in \
-			healthy) \
-				printf '%s\n' "[health] OCR Engine container is healthy."; \
-				exit 0 ;; \
-			unhealthy) \
-				printf '%s\n' '[health] OCR Engine container reported unhealthy.' >&2; \
-				$(DOCKER_COMPOSE) ps >&2 || true; \
-				$(DOCKER_COMPOSE) logs --tail 100 $(COMPOSE_SERVICE) >&2 || true; \
-				exit 1 ;; \
-		esac; \
-		if [[ $$(date +%s) -ge $$deadline ]]; then \
-			printf '%s\n' '[health] Timed out waiting for OCR Engine to become healthy.' >&2; \
-			$(DOCKER_COMPOSE) ps >&2 || true; \
-			$(DOCKER_COMPOSE) logs --tail 100 $(COMPOSE_SERVICE) >&2 || true; \
-			exit 1; \
-		fi; \
-		sleep $(WAIT_INTERVAL_SECONDS); \
-	done
-
-test-deploy: deploy
-
-deploy:
-	$(DOCKER_COMPOSE) config >/dev/null
-	$(DOCKER_COMPOSE) build $(COMPOSE_SERVICE)
-	$(DOCKER_COMPOSE) up -d --remove-orphans --no-build $(COMPOSE_SERVICE)
-	$(MAKE) health
-	$(DOCKER_COMPOSE) ps
+config build up down restart logs ps health test-deploy deploy:
+	$(MAKE) -C docker \
+		ENV_FILE="$(ENV_FILE)" \
+		COMPOSE_FILE="$(COMPOSE_FILE)" \
+		SECONDARY_COMPOSE_FILE="$(SECONDARY_COMPOSE_FILE)" \
+		COMPOSE_SERVICE="$(COMPOSE_SERVICE)" \
+		$@
 
 test:
 	$(PYTHON) -m pytest

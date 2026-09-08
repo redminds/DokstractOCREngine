@@ -3,12 +3,12 @@
 ## Prerequisites
 
 - Docker Engine 24+, Docker Compose v2
-- **DokstractDependencies** deployed first (for shared network `dokstract-shared`)
+- **DokstractDependencies** deployed first (for the environment-specific shared network)
 
 ## Required Environment File
 
 - `docker/.env`
-- Template: `docker/.env.example`
+- Deployed environments use an externally managed env file passed through `ENV_FILE`.
 
 ## Canonical Jenkins Script
 
@@ -29,7 +29,7 @@ make config
 or
 
 ```bash
-docker compose --env-file docker/.env -p dokstract-ocr-engine -f docker/docker-compose.yml config
+docker compose --env-file docker/.env -f docker/docker-compose.yml config
 ```
 
 ## Deploy Command
@@ -103,7 +103,7 @@ make down
 |---------|-------|-----|
 | `ENGINE_HOST_PORT is required` | Missing env var | Set in `docker/.env` |
 | Port 8010 already in use | Port collision | Stop old container or change port |
-| `dokstract-shared` network not found | Dependencies not deployed | Run `docker network create dokstract-shared` |
+| Shared network not found | Dependencies not deployed | Deploy the matching environment's Dokstract shared network |
 | Health check never becomes ready | Service booted but did not pass readiness | Review `make logs` output and the `/health/ready` response |
 
 ## Values That Change by Environment
