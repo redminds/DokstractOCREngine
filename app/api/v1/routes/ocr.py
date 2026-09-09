@@ -226,6 +226,13 @@ async def extract_document(
                 operation_status = "failed"
                 message = str(exc)
                 error_message = "Invalid OCR request."
+                logger.exception(
+                    "OCR input validation failed: request_id=%s file=%s error_type=%s message=%s",
+                    x_request_id,
+                    file.filename or "uploaded-file",
+                    type(exc).__name__,
+                    message,
+                )
                 if "Maximum" in message or "too large" in message.lower() or "pixel" in message.lower() or "exceeds" in message.lower():
                     error_code = "RESOURCE_LIMIT_EXCEEDED"
                     error_message = "OCR request exceeds supported limits."

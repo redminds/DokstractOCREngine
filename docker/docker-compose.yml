@@ -16,11 +16,8 @@ services:
       ENGINE_MAX_INFLIGHT_REQUESTS: ${ENGINE_MAX_INFLIGHT_REQUESTS:-2}
       OCR_MAX_CONCURRENCY: ${OCR_MAX_CONCURRENCY:-2}
 
-    ports:
-      - "127.0.0.1:${ENGINE_HOST_PORT:?ENGINE_HOST_PORT is required}:8010"
-
     volumes:
-      - ../.data:/app/.data
+      - ../.data/${DEPLOY_ENV:?DEPLOY_ENV is required}:/app/.data
       - ocr-cache:/app/.data/ocr-cache
 
     restart: unless-stopped
