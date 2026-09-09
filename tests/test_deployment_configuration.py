@@ -26,6 +26,8 @@ def test_compose_scopes_data_mount_and_shared_network():
     env = _read("docker/.env")
 
     assert "../.data/${DEPLOY_ENV:?DEPLOY_ENV is required}:/app/.data" in compose
+    assert "ports:" not in compose
+    assert "ENGINE_HOST_PORT" not in env
     assert "name: ${DOKSTRACT_SHARED_NETWORK:?DOKSTRACT_SHARED_NETWORK is required}" in compose
     assert "APP_ENV=${DEPLOY_ENV}" in env
     assert "COMPOSE_PROJECT_NAME=${ENGINE_SERVICE_NAME}-${DEPLOY_ENV}" in env

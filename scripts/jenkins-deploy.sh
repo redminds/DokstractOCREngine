@@ -83,6 +83,7 @@ rsync -a --delete \
   --exclude '.ruff_cache/' \
   --exclude '.cache/' \
   --exclude '.data/' \
+  --exclude 'workspace_tmp/' \
   --exclude 'logs/' \
   --exclude 'tmp/' \
   --exclude '*.bak' \
@@ -96,7 +97,6 @@ for rel in $required_source_files; do
     || fail "Missing deployed file after sync: $DEPLOY_ROOT/$rel"
 done
 
-chmod 600 "$ENV_FILE"
 
 log "Deploying $APP_NAME"
 

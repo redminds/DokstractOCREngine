@@ -82,7 +82,6 @@ make down
 | `ENGINE_SERVICE_NAME` | Stable engine service identity |
 | `ENGINE_HOST` | In-container bind host |
 | `ENGINE_PORT` | In-container API port |
-| `ENGINE_HOST_PORT` | Host-published port |
 | `PLATFORM_API_URL` | Platform API base URL for OCR execution reporting |
 | `OCR_ENGINE_OCR_API_TOKEN` | OCR API caller token for OCR Engine routes |
 | `OCR_ENGINE_SCHEMA_API_TOKEN` | Schema API caller token for OCR Engine routes |
@@ -101,8 +100,6 @@ make down
 
 | Failure | Cause | Fix |
 |---------|-------|-----|
-| `ENGINE_HOST_PORT is required` | Missing env var | Set in `docker/.env` |
-| Port 8010 already in use | Port collision | Stop old container or change port |
 | Shared network not found | Dependencies not deployed | Deploy the matching environment's Dokstract shared network |
 | Health check never becomes ready | Service booted but did not pass readiness | Review `make logs` output and the `/health/ready` response |
 
@@ -114,4 +111,3 @@ make down
 | `OCR_ENGINE_SCHEMA_API_TOKEN` | (per env) | **Strong secret** |
 | `PLATFORM_API_OCR_ENGINE_TOKEN` | (per env) | **Strong secret** |
 | `ENGINE_ADMIN_TOKEN` | (per env) | **Strong secret** |
-| `ENGINE_HOST_PORT` | 8010 | 8011 |
