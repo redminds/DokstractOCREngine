@@ -49,10 +49,11 @@ class TestSelectPages:
         assert result.page_numbers == [1, 2, 3, 4, 5]
         assert result.total_pages == 5
 
-    def test_no_selection_clamped_to_max(self):
-        result = select_pages(total_pages=50, pages_str=None, max_pages=10)
-        assert result.page_numbers == list(range(1, 11))
-        assert result.total_pages == 50
+    def test_no_selection_rejects_over_ceiling_instead_of_truncating(self):
+        # No silent truncation: an unscoped request larger than the safety
+        # ceiling must be rejected, never clamped to the first N pages.
+        with pytest.raises(ValueError, match="Maximum 10 pages allowed"):
+            select_pages(total_pages=50, pages_str=None, max_pages=10)
 
     def test_explicit_selection(self):
         result = select_pages(total_pages=15, pages_str="2,3,4", max_pages=15)
