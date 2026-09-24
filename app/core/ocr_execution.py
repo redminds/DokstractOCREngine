@@ -639,8 +639,10 @@ def select_pages(total_pages: int, pages_str: str | None, max_pages: int) -> Pdf
         page_numbers = parse_pages(pages_str)
         defaulted = False
     else:
-        page_numbers = list(range(1, min(total_pages, max_pages) + 1))
-        defaulted = total_pages > max_pages
+        # No explicit scope means all pages. Never silently truncate — the
+        # absolute safety ceiling is enforced (and rejected) below.
+        page_numbers = list(range(1, total_pages + 1))
+        defaulted = False
 
     if len(page_numbers) > max_pages:
         raise ValueError(f"Maximum {max_pages} pages allowed per request")
@@ -1198,7 +1200,7 @@ def extract_internal_ocr_document(
         doc = open_pdf_from_bytes(file_bytes)
         page_count = len(doc)
         try:
-            selection = select_pages(page_count, pages, int(SETTINGS.ocr_max_pdf_pages_per_request))
+            selection = select_pages(page_count, pages, int(SETTINGS.ocr_absolute_max_pages_per_request))
             selected_pages = selection.page_numbers
         finally:
             doc.close()
@@ -1277,7 +1279,7 @@ def extract_internal_ocr_document(
                         total_pages=page_count,
                         selected_pages=len(selected_pages),
                         max_pages_per_file=int(SETTINGS.ocr_max_pdf_pages_per_file),
-                        max_pages_per_request=int(SETTINGS.ocr_max_pdf_pages_per_request),
+                        max_pages_per_request=int(SETTINGS.ocr_absolute_max_pages_per_request),
                     )
                     for page_number in selected_pages:
                         page = doc[page_number - 1]

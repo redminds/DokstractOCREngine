@@ -62,8 +62,8 @@ class EngineSettings:
     ocr_max_image_pixels: int = int(os.getenv("OCR_MAX_IMAGE_PIXELS", str(24_000_000)))
     ocr_max_decoded_image_bytes: int = int(os.getenv("OCR_MAX_DECODED_IMAGE_BYTES", str(128 * 1024 * 1024)))
     ocr_max_upload_bytes: int = int(os.getenv("OCR_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
-    ocr_max_pdf_pages_per_file: int = int(os.getenv("OCR_MAX_PDF_PAGES_PER_FILE", "100"))
-    ocr_max_pdf_pages_per_request: int = int(os.getenv("OCR_MAX_PDF_PAGES_PER_REQUEST", "15"))
+    ocr_max_pdf_pages_per_file: int = int(os.getenv("OCR_MAX_PDF_PAGES_PER_FILE", "1000"))
+    ocr_absolute_max_pages_per_request: int = int(os.getenv("OCR_ABSOLUTE_MAX_PAGES_PER_REQUEST", "500"))
     # Image/page dimension limits
     ocr_max_image_width_pixels: int = int(os.getenv("OCR_MAX_IMAGE_WIDTH_PIXELS", "12000"))
     ocr_max_image_height_pixels: int = int(os.getenv("OCR_MAX_IMAGE_HEIGHT_PIXELS", "12000"))
@@ -165,8 +165,10 @@ def validate_startup_configuration() -> None:
         raise RuntimeError("OCR_STITCHED_PAGE_ASPECT_SIGNAL_THRESHOLD must not exceed OCR_MAX_PAGE_ASPECT_RATIO.")
     if not (0.0 <= SETTINGS.ocr_stitched_page_confidence_threshold <= 1.0):
         raise RuntimeError("OCR_STITCHED_PAGE_CONFIDENCE_THRESHOLD must be between 0.0 and 1.0.")
-    if SETTINGS.ocr_max_pdf_pages_per_request > SETTINGS.ocr_max_pdf_pages_per_file:
-        raise RuntimeError("OCR_MAX_PDF_PAGES_PER_REQUEST must not exceed OCR_MAX_PDF_PAGES_PER_FILE.")
+    if SETTINGS.ocr_absolute_max_pages_per_request > SETTINGS.ocr_max_pdf_pages_per_file:
+        raise RuntimeError("OCR_ABSOLUTE_MAX_PAGES_PER_REQUEST must not exceed OCR_MAX_PDF_PAGES_PER_FILE.")
+    if SETTINGS.ocr_absolute_max_pages_per_request < 1:
+        raise RuntimeError("OCR_ABSOLUTE_MAX_PAGES_PER_REQUEST must be positive.")
     if SETTINGS.platform_reporting_request_timeout_seconds <= 0:
         raise RuntimeError("PLATFORM_REPORTING_REQUEST_TIMEOUT_SECONDS must be positive.")
     if SETTINGS.platform_reporting_poll_interval_seconds <= 0:
