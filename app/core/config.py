@@ -96,6 +96,7 @@ class EngineSettings:
     ocr_result_cache_ttl_seconds: int = int(os.getenv("OCR_RESULT_CACHE_TTL_SECONDS", "86400"))
     ocr_result_cache_key_prefix: str = os.getenv("OCR_RESULT_CACHE_KEY_PREFIX", "dokstract:ocr:result").strip()
     ocr_result_cache_dir: str = os.getenv("OCR_RESULT_CACHE_DIR", "/app/.data/ocr-cache").strip()
+    ocr_recovery_policy_version: str = os.getenv("OCR_RECOVERY_POLICY_VERSION", "1").strip()
 
     # ── Image processing ─────────────────────────────────────────────────
     ocr_image_processing_default_enabled: bool = os.getenv("OCR_IMAGE_PROCESSING_DEFAULT_ENABLED", "false").strip().lower() == "true"
