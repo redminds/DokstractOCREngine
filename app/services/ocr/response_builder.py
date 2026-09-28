@@ -93,6 +93,7 @@ def build_response(
                 "line_id": item.line_id,
                 "block_id": item.block_id,
                 "reading_order": item.reading_order,
+                "provenance": item.provenance,
             })
 
         # Lines

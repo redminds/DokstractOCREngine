@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import difflib
 import logging
 import os
 import shutil
@@ -189,6 +190,7 @@ class OCRDependencyUnavailable(RuntimeError):
 
 
 _OCR_ENGINE = None
+_OCR_RECOVERY_ENGINE = None
 _OCR_ENGINE_DIAGNOSTICS: dict[str, Any] = {}
 
 
@@ -221,6 +223,34 @@ def _get_ocr_engine():
         # Capture diagnostics
         _OCR_ENGINE_DIAGNOSTICS.update(_capture_paddle_diagnostics(_OCR_ENGINE))
     return _OCR_ENGINE
+
+
+def _get_ocr_recovery_engine():
+    """Lazily initialize the bounded generic recovery detector."""
+    global _OCR_RECOVERY_ENGINE
+    if _OCR_RECOVERY_ENGINE is not None:
+        return _OCR_RECOVERY_ENGINE
+    try:
+        from paddleocr import PaddleOCR
+    except Exception as exc:  # pragma: no cover - environment-specific
+        raise OCRDependencyUnavailable(f"OCR recovery engine unavailable: {exc}") from exc
+
+    try:
+        _OCR_RECOVERY_ENGINE = PaddleOCR(
+            lang=SETTINGS.ocr_lang,
+            use_angle_cls=False,
+            det_limit_side_len=SETTINGS.ocr_recovery_det_limit_side_len,
+            det_limit_type="min",
+            det_db_thresh=SETTINGS.ocr_recovery_det_db_thresh,
+            det_db_box_thresh=SETTINGS.ocr_recovery_det_db_box_thresh,
+            use_dilation=True,
+            text_recognition_batch_size=SETTINGS.ocr_text_batch_size,
+            cpu_threads=SETTINGS.ocr_cpu_threads,
+            enable_mkldnn=SETTINGS.ocr_enable_mkldnn,
+        )
+    except Exception as exc:  # pragma: no cover - environment-specific
+        raise OCRDependencyUnavailable(f"OCR recovery engine unavailable: {exc}") from exc
+    return _OCR_RECOVERY_ENGINE
 
 
 def _capture_paddle_diagnostics(engine: Any) -> dict[str, Any]:
@@ -340,9 +370,21 @@ def run_ocr(image: np.ndarray, enhance: bool) -> _RawOCRResult:
     )
 
 
+def run_recovery_ocr(image: np.ndarray) -> _RawOCRResult:
+    """Run the bounded generic recovery detector on the original page image."""
+    image_height, image_width = image.shape[:2]
+    result = _get_ocr_recovery_engine().ocr(image, cls=False)
+    return _RawOCRResult(
+        raw_result=result,
+        image_width=float(image_width),
+        image_height=float(image_height),
+    )
+
+
 def _build_structured_page(
     raw_result: _RawOCRResult,
     page_number: int,
+    items_override: list[OCRItem] | None = None,
 ) -> tuple[OCRPage, dict[str, float]]:
     """Run the full geometry-aware pipeline on a single page.
 
@@ -361,12 +403,16 @@ def _build_structured_page(
 
     # Step 1: Adapt raw PaddleOCR result to internal OCRItem models
     t0 = time.perf_counter()
-    items = adapt_paddle_result(
-        raw_result.raw_result,
-        page_number=page_number,
-        page_width=raw_result.image_width,
-        page_height=raw_result.image_height,
-    )
+    if items_override is None:
+        items = adapt_paddle_result(
+            raw_result.raw_result,
+            page_number=page_number,
+            page_width=raw_result.image_width,
+            page_height=raw_result.image_height,
+        )
+    else:
+        items = items_override
+        timings["paddle_adaptation_ms"] = 0.0
     timings["paddle_adaptation_ms"] = (time.perf_counter() - t0) * 1000.0
 
     if not items:
@@ -488,6 +534,71 @@ def _build_structured_page(
     )
 
     return page, timings
+
+
+def _should_attempt_recovery(
+    image: np.ndarray,
+    page_data: OCRPage,
+    *,
+    enhance: bool,
+    rendering_profile: str,
+) -> bool:
+    """Trigger one recovery pass only for generic low-resolution sparse pages."""
+    if not SETTINGS.ocr_recovery_enabled or enhance or rendering_profile != "standard":
+        return False
+    height, width = image.shape[:2]
+    if max(height, width) >= SETTINGS.ocr_recovery_min_long_side:
+        return False
+    megapixels = max((height * width) / 1_000_000.0, 0.001)
+    return len(page_data.items) <= SETTINGS.ocr_recovery_max_items_per_megapixel * megapixels
+
+
+def _normalized_item_text(text: str) -> str:
+    return " ".join(str(text or "").lower().split())
+
+
+def _bbox_iou(left: BBox, right: BBox) -> float:
+    ix1 = max(left.x1, right.x1)
+    iy1 = max(left.y1, right.y1)
+    ix2 = min(left.x2, right.x2)
+    iy2 = min(left.y2, right.y2)
+    intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    left_area = left.width * left.height
+    right_area = right.width * right.height
+    union = left_area + right_area - intersection
+    return intersection / union if union > 0.0 else 0.0
+
+
+def _same_ocr_item(left: OCRItem, right: OCRItem) -> bool:
+    if _bbox_iou(left.bbox, right.bbox) < 0.25:
+        return False
+    left_text = _normalized_item_text(left.text)
+    right_text = _normalized_item_text(right.text)
+    if not left_text or not right_text:
+        return True
+    if left_text in right_text or right_text in left_text:
+        return True
+    return difflib.SequenceMatcher(None, left_text, right_text).ratio() >= 0.8
+
+
+def _merge_recovery_items(
+    baseline_items: list[OCRItem],
+    recovery_items: list[OCRItem],
+    page_number: int,
+) -> tuple[list[OCRItem], int]:
+    """Preserve baseline items and add non-duplicate recovery items."""
+    merged = list(baseline_items)
+    for item in merged:
+        item.provenance = "baseline"
+    added = 0
+    for index, item in enumerate(recovery_items):
+        item.item_id = f"p{page_number}_r{index}"
+        item.provenance = "recovery:detector-min-2048"
+        if any(_same_ocr_item(item, existing) for existing in merged):
+            continue
+        merged.append(item)
+        added += 1
+    return merged, added
 
 
 def _validate_image_dimensions(width: int, height: int) -> None:
@@ -731,7 +842,8 @@ def is_digital_pdf_text(text: str, threshold: int) -> bool:
 
 
 def _build_results_for_image(
-    image: np.ndarray, *, page: int, enhance: bool, profile_name: str = "none"
+    image: np.ndarray, *, page: int, enhance: bool, profile_name: str = "none",
+    rendering_profile: str = "standard",
 ) -> tuple[OCRPage, dict[str, float], ProcessingResult | None]:
     """Run OCR with geometry pipeline on a single image.
 
@@ -794,6 +906,49 @@ def _build_results_for_image(
 
     # Geometry pipeline
     page_data, geom_timings = _build_structured_page(raw_result, page_number=page)
+    recovery_meta: dict[str, Any] = {"attempted": False, "added_items": 0}
+    if _should_attempt_recovery(
+        processed_image,
+        page_data,
+        enhance=enhance,
+        rendering_profile=rendering_profile,
+    ):
+        recovery_start = time.perf_counter()
+        recovery_raw = run_recovery_ocr(processed_image)
+        recovery_items = adapt_paddle_result(
+            recovery_raw.raw_result,
+            page_number=page,
+            page_width=recovery_raw.image_width,
+            page_height=recovery_raw.image_height,
+        )
+        baseline_count = len(page_data.items)
+        merged_items, added_items = _merge_recovery_items(
+            page_data.items, recovery_items, page,
+        )
+        page_data, recovery_geom_timings = _build_structured_page(
+            _RawOCRResult(
+                raw_result=None,
+                image_width=recovery_raw.image_width,
+                image_height=recovery_raw.image_height,
+            ),
+            page_number=page,
+            items_override=merged_items,
+        )
+        for key, value in recovery_geom_timings.items():
+            geom_timings[key] = geom_timings.get(key, 0.0) + value
+        geom_timings["recovery_inference_ms"] = (time.perf_counter() - recovery_start) * 1000.0
+        recovery_meta = {
+            "attempted": True,
+            "trigger": "low_resolution_sparse_baseline",
+            "baseline_items": baseline_count,
+            "recovery_items": len(recovery_items),
+            "added_items": added_items,
+            "detector_limit_side_len": SETTINGS.ocr_recovery_det_limit_side_len,
+            "detector_limit_type": "min",
+            "db_thresh": SETTINGS.ocr_recovery_det_db_thresh,
+            "db_box_thresh": SETTINGS.ocr_recovery_det_db_box_thresh,
+            "geometry_mapping": "same original page coordinates",
+        }
     timings.update(geom_timings)
 
     timings["page_total_ms"] = (
@@ -806,6 +961,7 @@ def _build_results_for_image(
     }
     page_data.page_metrics["classification"] = classification.classification.value
     page_data.page_metrics["render_strategy"] = plan.strategy
+    page_data.page_metrics["recovery"] = recovery_meta
     if stitched_warning:
         page_data.page_metrics["stitched_warning"] = stitched_warning
 
@@ -867,6 +1023,7 @@ def _run_page_with_targeted_fallback(
         page=page,
         enhance=enhance,
         profile_name=profile_name,
+        rendering_profile=rendering_profile,
     )
     if not _should_attempt_targeted_fallback(page_data, rendering_profile, enhance):
         return page_data, page_timings, processing_result, None
@@ -880,6 +1037,7 @@ def _run_page_with_targeted_fallback(
         page=page,
         enhance=True,
         profile_name=fallback_profile,
+        rendering_profile=rendering_profile,
     )
 
     original_score = _page_quality_score(page_data)
@@ -1015,6 +1173,7 @@ def _page_dict_to_ocrpage(d: dict) -> OCRPage:
             line_id=item_d.get("line_id"),
             block_id=item_d.get("block_id"),
             reading_order=int(item_d.get("reading_order", 0)),
+            provenance=item_d.get("provenance", "baseline"),
         ))
     lines = []
     for line_d in d.get("lines", []):
@@ -1088,6 +1247,7 @@ def _ocrpage_to_page_dict(page: OCRPage) -> dict:
             "line_id": item.line_id,
             "block_id": item.block_id,
             "reading_order": item.reading_order,
+            "provenance": item.provenance,
         })
     lines_out = []
     for line in page.lines:
