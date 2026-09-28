@@ -48,6 +48,7 @@ class OCRItem:
     line_id: str | None = None
     block_id: str | None = None
     reading_order: int = 0
+    provenance: str = "baseline"
 
 
 @dataclass
