@@ -54,6 +54,13 @@ class EngineSettings:
     ocr_enable_mkldnn: bool = os.getenv("OCR_ENABLE_MKLDNN", "false").strip().lower() == "true"
     ocr_det_limit_side_len: int = int(os.getenv("OCR_DET_LIMIT_SIDE_LEN", "1536"))
     ocr_text_batch_size: int = int(os.getenv("OCR_TEXT_BATCH_SIZE", "2"))
+    # Bounded generic recovery for low-resolution pages with sparse OCR.
+    ocr_recovery_enabled: bool = os.getenv("OCR_RECOVERY_ENABLED", "true").strip().lower() == "true"
+    ocr_recovery_min_long_side: int = int(os.getenv("OCR_RECOVERY_MIN_LONG_SIDE", "1400"))
+    ocr_recovery_max_items_per_megapixel: float = float(os.getenv("OCR_RECOVERY_MAX_ITEMS_PER_MEGAPIXEL", "25"))
+    ocr_recovery_det_limit_side_len: int = int(os.getenv("OCR_RECOVERY_DET_LIMIT_SIDE_LEN", "2048"))
+    ocr_recovery_det_db_thresh: float = float(os.getenv("OCR_RECOVERY_DET_DB_THRESH", "0.2"))
+    ocr_recovery_det_db_box_thresh: float = float(os.getenv("OCR_RECOVERY_DET_DB_BOX_THRESH", "0.3"))
     ocr_max_render_dpi: int = int(os.getenv("OCR_MAX_RENDER_DPI", "180"))
     ocr_pdf_render_scale: float = float(os.getenv("OCR_PDF_RENDER_SCALE", "1.4"))
     ocr_low_content_render_scale: float = float(os.getenv("OCR_LOW_CONTENT_RENDER_SCALE", "1.2"))
