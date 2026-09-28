@@ -1,5 +1,7 @@
 .PHONY: \
 	help \
+	test \
+	compile \
 	preflight \
 	config \
 	build \
@@ -12,7 +14,7 @@
 	test-deploy \
 	deploy
 
-SHELL := /bin/bash
+SHELL := bash
 .SHELLFLAGS := -Eeuo pipefail -c
 
 # -----------------------------------------------------------------------------
@@ -37,6 +39,7 @@ REPO_ROOT := $(abspath $(MAKEFILE_DIR)/..)
 ENV_FILE ?= .env
 COMPOSE_FILE ?= docker-compose.yml
 SECONDARY_COMPOSE_FILE ?= docker-compose.secondary-network.yml
+TEST_COMPOSE_FILE ?= docker-compose.test.yml
 
 # Preserve absolute paths.
 # Resolve relative paths against the directory containing this Makefile.
@@ -45,6 +48,7 @@ resolve_path = $(if $(filter /%,$(1)),$(1),$(abspath $(MAKEFILE_DIR)/$(1)))
 RESOLVED_ENV_FILE := $(call resolve_path,$(ENV_FILE))
 RESOLVED_COMPOSE_FILE := $(call resolve_path,$(COMPOSE_FILE))
 RESOLVED_SECONDARY_COMPOSE_FILE := $(call resolve_path,$(SECONDARY_COMPOSE_FILE))
+RESOLVED_TEST_COMPOSE_FILE := $(call resolve_path,$(TEST_COMPOSE_FILE))
 
 # Ensure ${ENV_FILE} inside docker-compose.yml resolves to the authoritative
 # environment file path.
@@ -90,6 +94,11 @@ LOG_TAIL_LINES ?= 100
 DOCKER_COMPOSE = docker compose \
 	--env-file "$(RESOLVED_ENV_FILE)" \
 	$(COMPOSE_FILE_ARGS)
+
+DOCKER_TEST_COMPOSE = docker compose \
+	--env-file "$(RESOLVED_ENV_FILE)" \
+	-f "$(RESOLVED_COMPOSE_FILE)" \
+	-f "$(RESOLVED_TEST_COMPOSE_FILE)"
 
 # -----------------------------------------------------------------------------
 # Help
@@ -210,6 +219,16 @@ preflight:
 # -----------------------------------------------------------------------------
 # Compose operations
 # -----------------------------------------------------------------------------
+
+test: preflight
+	@test -f "$(RESOLVED_TEST_COMPOSE_FILE)"
+	$(DOCKER_TEST_COMPOSE) run --rm --no-deps --build ocr-engine-tests
+
+compile: preflight
+	$(DOCKER_TEST_COMPOSE) run --rm --no-deps --build --entrypoint python ocr-engine-tests \
+		-m py_compile \
+		app/main.py app/core/config.py app/core/registry.py app/core/service.py \
+		app/api/v1/routes/engine.py app/api/v1/routes/admin.py
 
 config: preflight
 	$(DOCKER_COMPOSE) config

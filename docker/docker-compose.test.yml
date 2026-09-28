@@ -1,0 +1,17 @@
+services:
+  ocr-engine-tests:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    working_dir: /workspace
+    command: ["pytest", "-q"]
+    environment:
+      PYTHONPATH: /workspace
+      OCR_ENGINE_OCR_API_TOKEN: change-me-ocr-api-to-engine
+      OCR_ENGINE_SCHEMA_API_TOKEN: change-me-schema-api-to-engine
+      TEACHING_OCR_ENGINE_TOKEN: change-me-teaching-agent-to-engine
+      PLATFORM_API_OCR_ENGINE_TOKEN: change-me-platform-to-engine
+      ENGINE_ADMIN_TOKEN: change-me-admin
+      ENGINE_REGISTRY_DB_PATH: /tmp/ocr-engine-registry.db
+    volumes:
+      - ..:/workspace
