@@ -7,6 +7,7 @@ import os
 import shutil
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,8 @@ from app.services.ocr_cache import (
     get_cached_page,
     put_cached_page,
     sweep_stale_temp,
+    cache_mode_allows_read,
+    cache_mode_allows_write,
 )
 
 logger = logging.getLogger("dokstract.ocr_engine.execution")
@@ -1318,13 +1321,14 @@ def _cache_page_now(
     page_fingerprint: str,
     ocrpage: OCRPage,
     failures: list[int],
+    cache_writes_enabled: bool = True,
 ) -> None:
     """Cache a single page immediately after processing.
 
     On cache-write failure, records the page in *failures* so the
     caller can decide whether to abort (when cache is required).
     """
-    if not SETTINGS.ocr_result_cache_enabled:
+    if not cache_writes_enabled:
         return
     page_dict = _ocrpage_to_page_dict(ocrpage)
     success = put_cached_page(file_hash, page_number, page_fingerprint, page_dict)
@@ -1341,8 +1345,16 @@ def extract_internal_ocr_document(
     image_processing: str = "false",
     pages: str | None = None,
     image_processing_profile: str = "none",
+    cache_mode: str = "reuse",
 ) -> dict[str, Any]:
     total_start = time.perf_counter()
+    cache_mode = (cache_mode or "reuse").strip().lower()
+    if cache_mode not in {"reuse", "refresh", "bypass"}:
+        raise ValueError("cache_mode must be one of: reuse, refresh, bypass")
+    cache_reads_enabled = SETTINGS.ocr_result_cache_enabled and cache_mode_allows_read(cache_mode)
+    cache_writes_enabled = SETTINGS.ocr_result_cache_enabled and cache_mode_allows_write(cache_mode)
+    execution_id = uuid.uuid4().hex
+    ocr_version = f"{SETTINGS.ocr_image_processing_pipeline_version}-{execution_id[:12]}"
     filename = filename or "uploaded-file"
     lower_name = filename.lower()
     file_type = "pdf" if lower_name.endswith(".pdf") else "image" if (content_type or "").startswith("image/") else None
@@ -1369,6 +1381,18 @@ def extract_internal_ocr_document(
         selected_pages = [1]
 
     scale = 1.6 if enhance else SETTINGS.ocr_pdf_render_scale
+    rendering_config_fingerprint = "|".join(str(value) for value in (
+        SETTINGS.ocr_pdf_render_scale,
+        SETTINGS.ocr_low_content_render_scale,
+        SETTINGS.ocr_max_render_dpi,
+        SETTINGS.ocr_det_limit_side_len,
+        SETTINGS.ocr_recovery_enabled,
+        SETTINGS.ocr_recovery_min_long_side,
+        SETTINGS.ocr_recovery_max_items_per_megapixel,
+        SETTINGS.ocr_recovery_det_limit_side_len,
+        SETTINGS.ocr_recovery_det_db_thresh,
+        SETTINGS.ocr_recovery_det_db_box_thresh,
+    ))
     fingerprint = compute_request_fingerprint(
         file_hash=file_hash,
         selected_pages=selected_pages,
@@ -1378,11 +1402,13 @@ def extract_internal_ocr_document(
         ocr_lang=SETTINGS.ocr_lang,
         engine_version=SETTINGS.default_release_tag,
         render_scale=scale,
+        recovery_policy_version=SETTINGS.ocr_recovery_policy_version,
+        rendering_config_fingerprint=rendering_config_fingerprint,
     )
 
     # Check cache
     cache_hit = False
-    if SETTINGS.ocr_result_cache_enabled:
+    if cache_reads_enabled:
         cached = get_cached_result(fingerprint)
         if cached is not None:
             logger.info("Cache hit for fingerprint %s", fingerprint[:16])
@@ -1393,7 +1419,13 @@ def extract_internal_ocr_document(
                     "profile": profile_name,
                     "pipeline_version": SETTINGS.ocr_image_processing_pipeline_version,
                 },
-                "cache": {"status": "hit", "expires_at": cached.expires_at},
+                "cache": {"status": "hit", "mode": "reuse", "expires_at": cached.expires_at},
+                "execution": {
+                    "execution_id": cached.response.get("processing", {}).get("execution", {}).get("execution_id"),
+                    "ocr_version": cached.response.get("processing", {}).get("execution", {}).get("ocr_version"),
+                    "fresh": False,
+                    "cache_mode": "reuse",
+                },
             }
             return response
 
@@ -1415,6 +1447,8 @@ def extract_internal_ocr_document(
             ocr_lang=SETTINGS.ocr_lang,
             engine_version=SETTINGS.default_release_tag,
             render_scale=page_scale,
+            recovery_policy_version=SETTINGS.ocr_recovery_policy_version,
+            rendering_config_fingerprint=rendering_config_fingerprint,
         )
 
     pages_data: list[OCRPage] = []
@@ -1447,7 +1481,7 @@ def extract_internal_ocr_document(
                         # Digital PDF fast path — no rendering needed
                         if _has_usable_digital_text(page):
                             pfp = _page_fp(page_number, scale)
-                            cached_page_dict = get_cached_page(file_hash, page_number, pfp)
+                            cached_page_dict = get_cached_page(file_hash, page_number, pfp) if cache_reads_enabled else None
                             if cached_page_dict is not None:
                                 pages_data.append(_page_dict_to_ocrpage(cached_page_dict))
                                 logger.info("Page %d: digital, loaded from page cache", page_number)
@@ -1456,7 +1490,7 @@ def extract_internal_ocr_document(
                             if ocrpage is not None:
                                 pages_data.append(ocrpage)
                                 ocrpage.page_metrics["rendering_profile"] = "digital"
-                                _cache_page_now(file_hash, page_number, pfp, ocrpage, cache_failures)
+                                _cache_page_now(file_hash, page_number, pfp, ocrpage, cache_failures, cache_writes_enabled)
                                 continue
 
                         # ── Cheap preview for blank + low-content detection ──
@@ -1491,7 +1525,7 @@ def extract_internal_ocr_document(
                             pages_data.append(ocrpage)
                             logger.debug("Page %d: blank, skipped OCR", page_number)
                             pfp = _page_fp(page_number, 0.0)
-                            _cache_page_now(file_hash, page_number, pfp, ocrpage, cache_failures)
+                            _cache_page_now(file_hash, page_number, pfp, ocrpage, cache_failures, cache_writes_enabled)
                             continue
 
                         # Low-content classification on preview
@@ -1516,7 +1550,7 @@ def extract_internal_ocr_document(
 
                         # ── Check page cache with actual scale ─────────
                         pfp = _page_fp(page_number, page_scale)
-                        cached_page_dict = get_cached_page(file_hash, page_number, pfp)
+                        cached_page_dict = get_cached_page(file_hash, page_number, pfp) if cache_reads_enabled else None
                         if cached_page_dict is not None:
                             pages_data.append(_page_dict_to_ocrpage(cached_page_dict))
                             logger.info("Page %d: loaded from page cache (profile=%s)", page_number, rendering_profile)
@@ -1669,7 +1703,7 @@ def extract_internal_ocr_document(
                             pages_data.append(ocrpage)
 
                             # Cache page immediately
-                            _cache_page_now(file_hash, page_number, pfp, ocrpage, cache_failures)
+                            _cache_page_now(file_hash, page_number, pfp, ocrpage, cache_failures, cache_writes_enabled)
                         except ValueError as page_exc:
                             # Per-page failure — record and continue to next page
                             msg = str(page_exc)
@@ -1687,7 +1721,7 @@ def extract_internal_ocr_document(
                 # Image file — use standard scale for single page
                 img_scale = scale
                 pfp = _page_fp(1, img_scale)
-                cached_page_dict = get_cached_page(file_hash, 1, pfp)
+                cached_page_dict = get_cached_page(file_hash, 1, pfp) if cache_reads_enabled else None
                 if cached_page_dict is not None:
                     ocrpage = _page_dict_to_ocrpage(cached_page_dict)
                     pages_data.append(ocrpage)
@@ -1718,7 +1752,7 @@ def extract_internal_ocr_document(
                         ocrpage.page_metrics["render_scale"] = round(img_scale, 2)
                         ocrpage.page_metrics["render_dpi"] = round(img_scale * 72, 1)
                         pages_data.append(ocrpage)
-                        _cache_page_now(file_hash, 1, pfp, ocrpage, cache_failures)
+                        _cache_page_now(file_hash, 1, pfp, ocrpage, cache_failures, cache_writes_enabled)
                     except ValueError as page_exc:
                         msg = str(page_exc)
                         logger.warning("Image page failed: %s", msg[:200])
@@ -1755,13 +1789,19 @@ def extract_internal_ocr_document(
             "profile": profile_name,
             "pipeline_version": SETTINGS.ocr_image_processing_pipeline_version,
         },
-        "cache": {"status": "miss"},
+        "cache": {"status": "bypassed" if cache_mode == "bypass" else "pending", "mode": cache_mode},
+        "execution": {
+            "execution_id": execution_id,
+            "ocr_version": ocr_version,
+            "fresh": True,
+            "cache_mode": cache_mode,
+        },
     }
     if processing_meta:
         response["processing"]["image_processing"].update(processing_meta)
 
     # Write full-document cache only after all pages succeeded
-    if SETTINGS.ocr_result_cache_enabled:
+    if cache_writes_enabled:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
         ttl = SETTINGS.ocr_result_cache_ttl_seconds
@@ -1787,7 +1827,7 @@ def extract_internal_ocr_document(
         )
         success = put_cached_result(fingerprint, cached_result)
         if success:
-            response["processing"]["cache"] = {"status": "stored", "expires_at": expires.isoformat()}
+            response["processing"]["cache"] = {"status": "stored", "mode": cache_mode, "expires_at": expires.isoformat()}
         elif SETTINGS.ocr_result_cache_required:
             raise RuntimeError("OCR result cache write failed and cache is required")
         else:

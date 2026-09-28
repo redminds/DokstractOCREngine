@@ -135,6 +135,7 @@ async def extract_document(
     image_processing: str = Form("false"),
     image_processing_profile: str = Form("none"),
     pages: str | None = Form(None),
+    cache_mode: str = Form("reuse"),
     x_request_id: str | None = Header(default=None, alias="X-Request-ID"),
     x_correlation_id: str | None = Header(default=None, alias="X-Correlation-ID"),
     x_job_id: str | None = Header(default=None, alias="X-Job-ID"),
@@ -205,6 +206,7 @@ async def extract_document(
                     image_processing=image_processing,
                     pages=pages,
                     image_processing_profile=image_processing_profile,
+                    cache_mode=cache_mode,
                 )
             except ocr_execution.OCRDependencyUnavailable as exc:
                 operation_status = "failed"

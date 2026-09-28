@@ -20,6 +20,14 @@ from app.core.config import SETTINGS
 logger = logging.getLogger("dokstract.ocr_engine.cache")
 
 
+def cache_mode_allows_read(cache_mode: str) -> bool:
+    return (cache_mode or "reuse").strip().lower() == "reuse"
+
+
+def cache_mode_allows_write(cache_mode: str) -> bool:
+    return (cache_mode or "reuse").strip().lower() in {"reuse", "refresh"}
+
+
 @dataclass
 class CachedOCRResult:
     cache_key: str
@@ -56,6 +64,8 @@ def compute_request_fingerprint(
     ocr_lang: str,
     engine_version: str,
     render_scale: float,
+    recovery_policy_version: str = "1",
+    rendering_config_fingerprint: str = "1",
 ) -> str:
     """Build a deterministic cache key from all output-affecting inputs."""
     normalised_pages = ",".join(str(p) for p in sorted(set(selected_pages)))
@@ -68,6 +78,8 @@ def compute_request_fingerprint(
         ocr_lang,
         engine_version,
         str(round(render_scale, 2)),
+        recovery_policy_version,
+        rendering_config_fingerprint,
     ]
     raw = "|".join(components)
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -82,6 +94,8 @@ def compute_page_fingerprint(
     ocr_lang: str,
     engine_version: str,
     render_scale: float,
+    recovery_policy_version: str = "1",
+    rendering_config_fingerprint: str = "1",
 ) -> str:
     """Build a deterministic cache key for a single page's output.
 
@@ -101,6 +115,8 @@ def compute_page_fingerprint(
         ocr_lang,
         engine_version,
         str(round(render_scale, 2)),
+        recovery_policy_version,
+        rendering_config_fingerprint,
     ]
     raw = "|".join(components)
     return hashlib.sha256(raw.encode()).hexdigest()
