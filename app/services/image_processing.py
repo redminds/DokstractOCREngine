@@ -3,6 +3,9 @@
 Supported profiles:
   - none: No enhancement, use original image
   - document_standard: Conservative grayscale + contrast normalization + light denoise + optional deskew
+
+Request-level profiles are normalized by ``resolve_processing_profile``. The
+legacy names remain internal compatibility aliases for the existing pipeline.
 """
 
 from __future__ import annotations
@@ -18,6 +21,52 @@ import numpy as np
 from app.core.config import SETTINGS
 
 logger = logging.getLogger("dokstract.ocr_engine.image_processing")
+
+SUPPORTED_PROCESSING_PROFILES = ("standard_auto", "enhanced_scan_recovery")
+
+
+def resolve_processing_profile(
+    processing_profile: str | None,
+    image_processing: str | bool | None,
+    image_processing_profile: str | None,
+) -> tuple[str, str]:
+    """Resolve the external profile and its effective normalized value.
+
+    An explicit normalized profile wins over legacy fields. Legacy aliases are
+    accepted only for rollout compatibility and are never used in the cache
+    identity once resolved.
+    """
+    normalized = (processing_profile or "").strip().lower()
+    legacy_name = (image_processing_profile or "").strip().lower()
+    legacy_enabled = str(image_processing or "false").strip().lower() == "true"
+
+    if normalized:
+        if normalized not in SUPPORTED_PROCESSING_PROFILES:
+            raise ValueError(
+                "Unsupported processing_profile: "
+                f"{normalized}. Supported profiles: {', '.join(SUPPORTED_PROCESSING_PROFILES)}"
+            )
+        return normalized, normalized
+
+    if legacy_name:
+        if legacy_name == "none":
+            return "legacy:image_processing_profile=none", "standard_auto"
+        if legacy_name == "document_standard":
+            return "legacy:image_processing_profile=document_standard", "enhanced_scan_recovery"
+        raise ValueError(f"Unsupported image processing profile: {legacy_name}")
+
+    if legacy_enabled:
+        return "legacy:image_processing=true", "enhanced_scan_recovery"
+    return "legacy:image_processing=false", "standard_auto"
+
+
+def internal_profile_for_effective(effective_profile: str) -> tuple[bool, str]:
+    """Map a normalized request profile to the existing processing pipeline."""
+    if effective_profile == "standard_auto":
+        return False, "none"
+    if effective_profile == "enhanced_scan_recovery":
+        return True, "document_standard"
+    raise ValueError(f"Unsupported effective processing profile: {effective_profile}")
 
 
 @dataclass

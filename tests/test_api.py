@@ -358,6 +358,38 @@ def test_ocr_max_concurrency_defaults_to_two(monkeypatch):
         loop.close()
 
 
+def test_queue_timeout_does_not_release_unacquired_concurrency_slot(monkeypatch):
+    import asyncio as aio
+    import pytest
+    from fastapi import HTTPException
+
+    import app.api.v1.routes.ocr as ocr_mod
+
+    class NeverAcquired:
+        def __init__(self):
+            self.releases = 0
+
+        async def acquire(self):
+            raise aio.TimeoutError
+
+        def release(self):
+            self.releases += 1
+
+    semaphore = NeverAcquired()
+    monkeypatch.setattr(ocr_mod, "_OCR_CONCURRENCY_SEMAPHORE", semaphore)
+
+    async def exercise():
+        with pytest.raises(HTTPException) as exc_info:
+            async with ocr_mod._acquire_engine_request_slot():
+                pass
+        return exc_info.value
+
+    error = aio.run(exercise())
+    assert error.status_code == 429
+    assert error.detail["error"]["code"] == "QUEUE_TIMEOUT"
+    assert semaphore.releases == 0
+
+
 def test_internal_extract_allows_schema_service(monkeypatch):
     monkeypatch.setattr("app.main.engine_service", make_service())
     client = TestClient(app)
