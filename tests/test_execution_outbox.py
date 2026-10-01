@@ -55,15 +55,21 @@ def test_outbox_persists_event_across_registry_instances(monkeypatch):
             "page_count": 2,
             "status": "success",
             "duration_ms": 120,
+            "metadata": {"ocr_run_summary": {"schema_version": 1, "cache": {"mode": "refresh", "outcome": "refreshed"}}},
         }
 
-        asyncio.run(service.enqueue(payload))
+        first = asyncio.run(service.enqueue(payload))
+        assert first is None
         stats = registry.get_ocr_execution_outbox_stats()
         assert stats["pending"] == 1
 
         reloaded_registry = _make_registry(db_path)
         reloaded_stats = reloaded_registry.get_ocr_execution_outbox_stats()
         assert reloaded_stats["pending"] == 1
+        persisted = reloaded_registry.claim_due_ocr_execution_outbox_events(limit=1, claim_timeout_seconds=1)
+        assert persisted[0].payload == payload
+        duplicate = reloaded_registry.enqueue_ocr_execution_outbox_event({**payload, "status": "failed"})
+        assert duplicate.payload == payload
     finally:
         db_path.unlink(missing_ok=True)
 

@@ -98,6 +98,7 @@ async def _acquire_engine_request_slot():
     """Acquire a processing slot with bounded queue and timeout."""
     queue_sem = _get_queue_semaphore()
     queue_acquired = False
+    concurrency_acquired = False
     try:
         try:
             queue_acquired = await asyncio.wait_for(
@@ -113,14 +114,16 @@ async def _acquire_engine_request_slot():
                 _OCR_CONCURRENCY_SEMAPHORE.acquire(),
                 timeout=SETTINGS.ocr_queue_wait_timeout_seconds,
             )
+            concurrency_acquired = True
         except asyncio.TimeoutError:
             raise HTTPException(
-                status_code=503,
+                status_code=429,
                 detail=_error("QUEUE_TIMEOUT", "Timed out waiting for processing slot."),
             )
         yield
     finally:
-        _OCR_CONCURRENCY_SEMAPHORE.release()
+        if concurrency_acquired:
+            _OCR_CONCURRENCY_SEMAPHORE.release()
         if queue_acquired:
             queue_sem.release()
 
@@ -133,7 +136,8 @@ async def extract_document(
     api_version: str = Form("v1"),
     capabilities: str | None = Form(None),
     image_processing: str = Form("false"),
-    image_processing_profile: str = Form("none"),
+    image_processing_profile: str | None = Form(None),
+    processing_profile: str | None = Form(None),
     pages: str | None = Form(None),
     cache_mode: str = Form("reuse"),
     x_request_id: str | None = Header(default=None, alias="X-Request-ID"),
@@ -206,7 +210,10 @@ async def extract_document(
                     image_processing=image_processing,
                     pages=pages,
                     image_processing_profile=image_processing_profile,
+                    processing_profile=processing_profile,
                     cache_mode=cache_mode,
+                    request_id=x_request_id,
+                    correlation_id=x_correlation_id,
                 )
             except ocr_execution.OCRDependencyUnavailable as exc:
                 operation_status = "failed"
@@ -218,10 +225,15 @@ async def extract_document(
                 ) from exc
             except RuntimeError as exc:
                 operation_status = "failed"
-                error_code = "CACHE_WRITE_FAILED"
-                error_message = "OCR engine cache write failed."
+                logger.exception(
+                    "OCR execution runtime failure: request_id=%s file=%s",
+                    x_request_id,
+                    file.filename or "uploaded-file",
+                )
+                error_code = "OCR_EXECUTION_FAILED"
+                error_message = "OCR engine execution failed."
                 raise HTTPException(
-                    status_code=503,
+                    status_code=500,
                     detail=_error(error_code, error_message),
                 ) from exc
             except ValueError as exc:
@@ -286,9 +298,23 @@ async def extract_document(
         try:
             if execution_started:
                 release = outcome.assigned_release
+                occurred_at = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z"
+                event_metadata = {
+                    "supported_api_versions": release.get("supported_api_versions"),
+                    "engine_capabilities": release.get("capabilities"),
+                }
+                manifest = (payload.get("processing") or {}).get("ocr_run_manifest") if isinstance(payload, dict) else None
+                run_summary = ocr_execution._build_ocr_run_summary_for_outbox(
+                    manifest=manifest,
+                    execution_status=operation_status,
+                    engine_release=release.get("release_tag"),
+                    completed_at=occurred_at,
+                )
+                if run_summary is not None:
+                    event_metadata["ocr_run_summary"] = run_summary
                 event_payload = {
                     "event_id": uuid.uuid4().hex,
-                    "occurred_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + "Z",
+                    "occurred_at": occurred_at,
                     "caller_service": service_name,
                     "operation": route_name,
                     "page_count": page_count if payload is not None else 0,
@@ -311,10 +337,7 @@ async def extract_document(
                     "capabilities": requested_capabilities,
                     "error_code": error_code,
                     "error_message": error_message,
-                    "metadata": {
-                        "supported_api_versions": release.get("supported_api_versions"),
-                        "engine_capabilities": release.get("capabilities"),
-                    },
+                    "metadata": event_metadata,
                 }
                 await execution_outbox_service.enqueue(event_payload)
         except Exception as exc:
