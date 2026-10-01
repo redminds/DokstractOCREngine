@@ -20,8 +20,16 @@ from app.core.config import SETTINGS
 from app.services.image_processing import (
     ProcessingResult,
     apply_profile,
+    internal_profile_for_effective,
     inspect_image_metadata,
+    resolve_processing_profile,
     resolve_profile,
+)
+from app.services.processing_policy import effective_processing_policy_fingerprint
+from app.services.ocr.quality_assessment import (
+    QUALITY_REASON_CODES,
+    QUALITY_REASON_SEVERITIES,
+    build_quality_assessment,
 )
 from app.services.ocr.models import OCRPage, OCRItem, OCRLine, OCRBlock, BBox
 from app.services.ocr.paddle_adapter import adapt_paddle_result
@@ -195,6 +203,21 @@ class OCRDependencyUnavailable(RuntimeError):
 _OCR_ENGINE = None
 _OCR_RECOVERY_ENGINE = None
 _OCR_ENGINE_DIAGNOSTICS: dict[str, Any] = {}
+_OCR_FORCE_MKLDNN_DISABLED = False
+
+
+def _is_mkldnn_runtime_error(exc: RuntimeError) -> bool:
+    message = str(exc).lower()
+    return "could not execute a primitive" in message or "mkldnn" in message or "onednn" in message
+
+
+def _reset_ocr_engines_without_mkldnn() -> None:
+    global _OCR_ENGINE, _OCR_RECOVERY_ENGINE, _OCR_ENGINE_DIAGNOSTICS, _OCR_FORCE_MKLDNN_DISABLED
+    _OCR_FORCE_MKLDNN_DISABLED = True
+    _OCR_ENGINE = None
+    _OCR_RECOVERY_ENGINE = None
+    _OCR_ENGINE_DIAGNOSTICS = {}
+    logger.warning("Resetting OCR engines with MKL-DNN disabled after an inference primitive failure")
 
 
 def _get_ocr_engine():
@@ -215,7 +238,7 @@ def _get_ocr_engine():
                 use_dilation=True,
                 text_recognition_batch_size=SETTINGS.ocr_text_batch_size,
                 cpu_threads=SETTINGS.ocr_cpu_threads,
-                enable_mkldnn=SETTINGS.ocr_enable_mkldnn,
+                enable_mkldnn=SETTINGS.ocr_enable_mkldnn and not _OCR_FORCE_MKLDNN_DISABLED,
             )
         except Exception as exc:  # pragma: no cover - environment-specific
             raise OCRDependencyUnavailable(f"OCR engine unavailable: {exc}") from exc
@@ -249,7 +272,7 @@ def _get_ocr_recovery_engine():
             use_dilation=True,
             text_recognition_batch_size=SETTINGS.ocr_text_batch_size,
             cpu_threads=SETTINGS.ocr_cpu_threads,
-            enable_mkldnn=SETTINGS.ocr_enable_mkldnn,
+            enable_mkldnn=SETTINGS.ocr_enable_mkldnn and not _OCR_FORCE_MKLDNN_DISABLED,
         )
     except Exception as exc:  # pragma: no cover - environment-specific
         raise OCRDependencyUnavailable(f"OCR recovery engine unavailable: {exc}") from exc
@@ -364,7 +387,14 @@ def run_ocr(image: np.ndarray, enhance: bool) -> _RawOCRResult:
         image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
     image_height, image_width = image.shape[:2]
-    result = _get_ocr_engine().ocr(image, cls=False)
+    try:
+        result = _get_ocr_engine().ocr(image, cls=False)
+    except RuntimeError as exc:
+        if not _OCR_FORCE_MKLDNN_DISABLED and SETTINGS.ocr_enable_mkldnn and _is_mkldnn_runtime_error(exc):
+            _reset_ocr_engines_without_mkldnn()
+            result = _get_ocr_engine().ocr(image, cls=False)
+        else:
+            raise
 
     return _RawOCRResult(
         raw_result=result,
@@ -376,7 +406,14 @@ def run_ocr(image: np.ndarray, enhance: bool) -> _RawOCRResult:
 def run_recovery_ocr(image: np.ndarray) -> _RawOCRResult:
     """Run the bounded generic recovery detector on the original page image."""
     image_height, image_width = image.shape[:2]
-    result = _get_ocr_recovery_engine().ocr(image, cls=False)
+    try:
+        result = _get_ocr_recovery_engine().ocr(image, cls=False)
+    except RuntimeError as exc:
+        if not _OCR_FORCE_MKLDNN_DISABLED and SETTINGS.ocr_enable_mkldnn and _is_mkldnn_runtime_error(exc):
+            _reset_ocr_engines_without_mkldnn()
+            result = _get_ocr_recovery_engine().ocr(image, cls=False)
+        else:
+            raise
     return _RawOCRResult(
         raw_result=result,
         image_width=float(image_width),
@@ -457,7 +494,14 @@ def _build_structured_page(
         remaining_lines = reconstruct_lines(
             remaining_items, page_width=raw_result.image_width, page_height=raw_result.image_height,
         ) if remaining_items else []
-        lines = remaining_lines + table_lines
+        # Table reconstruction returns its own rows.  Merge them back into
+        # the non-table stream by geometry; appending the table rows would
+        # move a recovered table region to the end of the page and corrupt
+        # canonical reading order.
+        lines = sorted(
+            remaining_lines + table_lines,
+            key=lambda line: (round(line.bbox.y1, 1), round(line.bbox.x1, 1)),
+        )
         from app.services.ocr.line_reconstruction import _sync_item_line_ids
         _sync_item_line_ids(items, lines)
         timings["table_reconstruction_ms"] = (time.perf_counter() - t0) * 1000.0
@@ -546,14 +590,52 @@ def _should_attempt_recovery(
     enhance: bool,
     rendering_profile: str,
 ) -> bool:
-    """Trigger one recovery pass only for generic low-resolution sparse pages."""
-    if not SETTINGS.ocr_recovery_enabled or enhance or rendering_profile != "standard":
+    """Trigger one bounded pass for generic low-resolution coverage gaps.
+
+    Sparse item counts are useful for pages where the detector found very
+    little.  They are not sufficient for a page where the detector finds a
+    heading and later content but skips a dense vertical band in between.  The
+    latter is detected from OCR geometry plus visible image content, without
+    knowing the document type, heading text, or page number.
+    """
+    if not SETTINGS.ocr_recovery_enabled or rendering_profile != "standard":
         return False
     height, width = image.shape[:2]
     if max(height, width) >= SETTINGS.ocr_recovery_min_long_side:
         return False
     megapixels = max((height * width) / 1_000_000.0, 0.001)
-    return len(page_data.items) <= SETTINGS.ocr_recovery_max_items_per_megapixel * megapixels
+    sparse_page = len(page_data.items) <= SETTINGS.ocr_recovery_max_items_per_megapixel * megapixels
+    if sparse_page:
+        return True
+
+    boxes = sorted(
+        (item.bbox for item in page_data.items if item.bbox is not None),
+        key=lambda bbox: (bbox.y1, bbox.x1),
+    )
+    if len(boxes) < 2:
+        return False
+
+    heights = sorted(max(1.0, bbox.y2 - bbox.y1) for bbox in boxes)
+    median_height = heights[len(heights) // 2]
+    minimum_gap = max(80.0, median_height * 4.0)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+
+    for previous, current in zip(boxes, boxes[1:]):
+        gap = current.y1 - previous.y2
+        if gap < minimum_gap:
+            continue
+        y1 = max(0, int(previous.y2))
+        y2 = min(gray.shape[0], int(current.y1))
+        if y2 <= y1:
+            continue
+        band = gray[y1:y2, :]
+        if band.size == 0:
+            continue
+        dark_ratio = float(np.mean(band < 210))
+        edge_ratio = float(np.mean(cv2.Canny(band, 50, 150) > 0))
+        if dark_ratio >= 0.015 or edge_ratio >= 0.025:
+            return True
+    return False
 
 
 def _normalized_item_text(text: str) -> str:
@@ -942,7 +1024,7 @@ def _build_results_for_image(
         geom_timings["recovery_inference_ms"] = (time.perf_counter() - recovery_start) * 1000.0
         recovery_meta = {
             "attempted": True,
-            "trigger": "low_resolution_sparse_baseline",
+            "trigger": "low_resolution_sparse_or_uncovered_band",
             "baseline_items": baseline_count,
             "recovery_items": len(recovery_items),
             "added_items": added_items,
@@ -1337,6 +1419,211 @@ def _cache_page_now(
         failures.append(page_number)
 
 
+def _manifest_fingerprint(value: str) -> str:
+    """Return a stable, non-sensitive fingerprint for manifest provenance."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+
+def _build_ocr_run_manifest(
+    *,
+    response: dict[str, Any],
+    source_file_hash: str,
+    selected_pages: list[int],
+    processing_profile: str,
+    cache_mode: str,
+    cache_outcome: str,
+    request_id: str | None,
+    correlation_id: str | None,
+    pipeline_fingerprint: str,
+    recovery_policy_fingerprint: str,
+    rendering_fingerprint: str,
+    requested_processing_profile: str | None = None,
+    processing_policy_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    """Build the stable execution summary without duplicating raw diagnostics."""
+    pages = response.get("pages") or []
+    processed_pages = [
+        int(page.get("page_number"))
+        for page in pages
+        if page.get("page_number") is not None
+    ]
+    page_summaries: list[dict[str, Any]] = []
+    recovery_pages: list[int] = []
+    recovery_items_added = 0
+    has_failed_page = False
+    has_review_signal = False
+    has_recovery = False
+
+    for page in pages:
+        page_number = page.get("page_number")
+        metrics = page.get("metrics") or page.get("page_metrics") or {}
+        recovery = metrics.get("recovery") if isinstance(metrics, dict) else None
+        recovery = recovery if isinstance(recovery, dict) else {}
+        attempted = bool(recovery.get("attempted"))
+        added_items = int(recovery.get("added_items") or 0)
+        if attempted:
+            has_recovery = True
+            if page_number is not None:
+                recovery_pages.append(int(page_number))
+            recovery_items_added += added_items
+        if isinstance(metrics, dict) and metrics.get("source") == "error":
+            has_failed_page = True
+        if isinstance(metrics, dict) and metrics.get("stitched_warning"):
+            has_review_signal = True
+        page_summaries.append({
+            "page_number": page_number,
+            "status": "failed" if isinstance(metrics, dict) and metrics.get("source") == "error" else "passed",
+            "confidence": page.get("confidence"),
+            "item_count": len(page.get("items") or []),
+            "line_count": len(page.get("lines") or []),
+            "recovery_attempted": attempted,
+            "recovery_items_added": added_items,
+            "review_signal": bool(isinstance(metrics, dict) and metrics.get("stitched_warning")),
+        })
+
+    quality_assessment = (response.get("processing") or {}).get("quality_assessment")
+    quality_status = quality_assessment.get("outcome") if isinstance(quality_assessment, dict) else None
+    if quality_status not in {"passed", "recovered", "needs_review", "failed"}:
+        if has_failed_page:
+            quality_status = "failed"
+        elif has_review_signal:
+            quality_status = "needs_review"
+        elif has_recovery:
+            quality_status = "recovered"
+        else:
+            quality_status = "passed"
+
+    execution = (response.get("processing") or {}).get("execution") or {}
+    summary = {
+        "manifest_version": 1,
+        "request_id": request_id,
+        "correlation_id": correlation_id,
+        "engine_execution_id": execution.get("execution_id"),
+        "engine_ocr_version": execution.get("ocr_version"),
+        "source_file_hash": source_file_hash,
+        "selected_pages": [int(page) for page in selected_pages],
+        "processed_pages": processed_pages,
+        "requested_processing_profile": requested_processing_profile or processing_profile,
+        "processing_profile": processing_profile,
+        "language": SETTINGS.ocr_lang,
+        "model_provider": "paddleocr",
+        "pipeline_fingerprint": pipeline_fingerprint,
+        "recovery_policy_fingerprint": recovery_policy_fingerprint,
+        "rendering_fingerprint": rendering_fingerprint,
+        "processing_policy_fingerprint": processing_policy_fingerprint,
+        "cache": {"mode": cache_mode, "outcome": cache_outcome},
+        "recovery": {
+            "attempted": has_recovery,
+            "pages": sorted(set(recovery_pages)),
+            "items_added": recovery_items_added,
+        },
+        "quality": {
+            "status": quality_status,
+            "page_summaries": page_summaries,
+        },
+        "quality_assessment": quality_assessment,
+    }
+
+    return summary
+
+
+def _build_ocr_run_summary_for_outbox(
+    *,
+    manifest: Any,
+    execution_status: str,
+    engine_release: Any,
+    completed_at: Any,
+) -> dict[str, Any] | None:
+    """Project only safe terminal facts into the existing outbox metadata."""
+    if str(execution_status or "").strip().lower() != "success" or not isinstance(manifest, dict):
+        return None
+
+    manifest_version = manifest.get("manifest_version")
+    execution_id = manifest.get("engine_execution_id")
+    ocr_version = manifest.get("engine_ocr_version")
+    processing_profile = manifest.get("processing_profile")
+    cache = manifest.get("cache")
+    selected_pages = manifest.get("selected_pages")
+    processed_pages = manifest.get("processed_pages")
+    release = engine_release if isinstance(engine_release, str) else None
+    completed = completed_at if isinstance(completed_at, str) else None
+
+    if (
+        manifest_version != 1
+        or not isinstance(execution_id, str) or not execution_id.strip()
+        or not isinstance(ocr_version, str) or not ocr_version.strip()
+        or not isinstance(processing_profile, str) or not processing_profile.strip()
+        or not isinstance(cache, dict)
+        or not isinstance(selected_pages, list)
+        or not isinstance(processed_pages, list)
+        or not release or not release.strip()
+        or not completed or not completed.strip()
+    ):
+        return None
+
+    cache_mode = cache.get("mode")
+    cache_outcome = cache.get("outcome")
+    if cache_mode not in {"reuse", "refresh", "bypass"} or cache_outcome not in {"hit", "miss", "refreshed", "bypassed"}:
+        return None
+
+    recovery = manifest.get("recovery")
+    recovery_outcome = "unknown"
+    if isinstance(recovery, dict):
+        explicit_outcome = recovery.get("outcome")
+        if explicit_outcome in {"not_needed", "attempted", "recovered", "failed", "unknown"}:
+            recovery_outcome = explicit_outcome
+        elif recovery.get("attempted") is False:
+            recovery_outcome = "not_needed"
+        elif recovery.get("attempted") is True:
+            try:
+                recovery_outcome = "recovered" if int(recovery.get("items_added") or 0) > 0 else "attempted"
+            except (TypeError, ValueError):
+                recovery_outcome = "attempted"
+
+    quality = manifest.get("quality")
+    quality_value = quality.get("status") if isinstance(quality, dict) else None
+    if quality_value not in {"passed", "recovered", "degraded", "needs_review", "failed", "unknown"}:
+        quality_value = "unknown"
+
+    projected_reasons: list[dict[str, Any]] = []
+    assessment = manifest.get("quality_assessment")
+    if isinstance(assessment, dict) and assessment.get("version") == 1:
+        for item in assessment.get("reasons") or []:
+            if not isinstance(item, dict):
+                continue
+            code = item.get("code")
+            severity = item.get("severity")
+            if code not in QUALITY_REASON_CODES or severity not in QUALITY_REASON_SEVERITIES:
+                continue
+            page_numbers = item.get("page_numbers")
+            affected_page_count = len({int(page) for page in page_numbers if isinstance(page, int) and page >= 1}) if isinstance(page_numbers, list) else 0
+            projected_reasons.append({
+                "code": code,
+                "severity": severity,
+                "affected_page_count": affected_page_count,
+            })
+
+    summary = {
+        "schema_version": 1,
+        "engine_execution_id": execution_id,
+        "ocr_version": ocr_version,
+        "run_manifest_version": 1,
+        "processing_profile": processing_profile,
+        "cache": {"mode": cache_mode, "outcome": cache_outcome},
+        "pages": {
+            "selected_count": len(selected_pages),
+            "processed_count": len(processed_pages),
+        },
+        "recovery": {"outcome": recovery_outcome},
+        "quality": {"outcome": quality_value},
+        "engine_release": release,
+        "completed_at": completed,
+    }
+    if projected_reasons or (isinstance(assessment, dict) and isinstance(assessment.get("reasons"), list)):
+        summary["quality"]["reason_codes"] = projected_reasons
+    return summary
+
+
 def extract_internal_ocr_document(
     *,
     file_bytes: bytes,
@@ -1344,8 +1631,11 @@ def extract_internal_ocr_document(
     content_type: str | None,
     image_processing: str = "false",
     pages: str | None = None,
-    image_processing_profile: str = "none",
+    image_processing_profile: str | None = None,
+    processing_profile: str | None = None,
     cache_mode: str = "reuse",
+    request_id: str | None = None,
+    correlation_id: str | None = None,
 ) -> dict[str, Any]:
     total_start = time.perf_counter()
     cache_mode = (cache_mode or "reuse").strip().lower()
@@ -1361,8 +1651,13 @@ def extract_internal_ocr_document(
     if file_type is None:
         raise ValueError("Unsupported file type")
 
-    enhance = image_processing.lower() == "true"
-    profile_name = resolve_profile(enhance, image_processing_profile)
+    requested_profile, effective_profile = resolve_processing_profile(
+        processing_profile,
+        image_processing,
+        image_processing_profile,
+    )
+    enhance, profile_name = internal_profile_for_effective(effective_profile)
+    policy_fingerprint = effective_processing_policy_fingerprint(effective_profile)
 
     # Compute file hash and check cache
     file_hash = compute_file_hash(file_bytes)
@@ -1393,17 +1688,33 @@ def extract_internal_ocr_document(
         SETTINGS.ocr_recovery_det_db_thresh,
         SETTINGS.ocr_recovery_det_db_box_thresh,
     ))
+    pipeline_fingerprint = _manifest_fingerprint("|".join((
+        SETTINGS.ocr_image_processing_pipeline_version,
+        SETTINGS.default_release_tag,
+        SETTINGS.ocr_lang,
+    )))
+    recovery_policy_fingerprint = _manifest_fingerprint("|".join(str(value) for value in (
+        SETTINGS.ocr_recovery_policy_version,
+        SETTINGS.ocr_recovery_enabled,
+        SETTINGS.ocr_recovery_min_long_side,
+        SETTINGS.ocr_recovery_max_items_per_megapixel,
+        SETTINGS.ocr_recovery_det_limit_side_len,
+        SETTINGS.ocr_recovery_det_db_thresh,
+        SETTINGS.ocr_recovery_det_db_box_thresh,
+    )))
+    rendering_fingerprint = _manifest_fingerprint(rendering_config_fingerprint)
     fingerprint = compute_request_fingerprint(
         file_hash=file_hash,
         selected_pages=selected_pages,
         image_processing_enabled=enhance,
-        image_processing_profile=profile_name,
+        image_processing_profile=effective_profile,
         pipeline_version=SETTINGS.ocr_image_processing_pipeline_version,
         ocr_lang=SETTINGS.ocr_lang,
         engine_version=SETTINGS.default_release_tag,
         render_scale=scale,
         recovery_policy_version=SETTINGS.ocr_recovery_policy_version,
         rendering_config_fingerprint=rendering_config_fingerprint,
+        effective_processing_policy_fingerprint=policy_fingerprint,
     )
 
     # Check cache
@@ -1413,20 +1724,40 @@ def extract_internal_ocr_document(
         if cached is not None:
             logger.info("Cache hit for fingerprint %s", fingerprint[:16])
             response = dict(cached.response)
+            cached_execution = (response.get("processing") or {}).get("execution") or {}
             response["processing"] = {
                 "image_processing": {
                     "enabled": enhance,
-                    "profile": profile_name,
+                    "profile": effective_profile,
+                    "requested_profile": requested_profile,
                     "pipeline_version": SETTINGS.ocr_image_processing_pipeline_version,
                 },
                 "cache": {"status": "hit", "mode": "reuse", "expires_at": cached.expires_at},
                 "execution": {
-                    "execution_id": cached.response.get("processing", {}).get("execution", {}).get("execution_id"),
-                    "ocr_version": cached.response.get("processing", {}).get("execution", {}).get("ocr_version"),
+                    "execution_id": cached_execution.get("execution_id"),
+                    "ocr_version": cached_execution.get("ocr_version"),
                     "fresh": False,
                     "cache_mode": "reuse",
                 },
             }
+            response["processing"]["quality_assessment"] = build_quality_assessment(
+                response, selected_pages=selected_pages
+            )
+            response["processing"]["ocr_run_manifest"] = _build_ocr_run_manifest(
+                response=response,
+                source_file_hash=file_hash,
+                selected_pages=selected_pages,
+                processing_profile=effective_profile,
+                requested_processing_profile=requested_profile,
+                cache_mode="reuse",
+                cache_outcome="hit",
+                request_id=request_id,
+                correlation_id=correlation_id,
+                pipeline_fingerprint=pipeline_fingerprint,
+                recovery_policy_fingerprint=recovery_policy_fingerprint,
+                rendering_fingerprint=rendering_fingerprint,
+                processing_policy_fingerprint=policy_fingerprint,
+            )
             return response
 
     # ── Page-level partial resume ────────────────────────────────────────
@@ -1442,13 +1773,14 @@ def extract_internal_ocr_document(
             file_hash=file_hash,
             page_number=pn,
             image_processing_enabled=enhance,
-            image_processing_profile=profile_name,
+            image_processing_profile=effective_profile,
             pipeline_version=SETTINGS.ocr_image_processing_pipeline_version,
             ocr_lang=SETTINGS.ocr_lang,
             engine_version=SETTINGS.default_release_tag,
             render_scale=page_scale,
             recovery_policy_version=SETTINGS.ocr_recovery_policy_version,
             rendering_config_fingerprint=rendering_config_fingerprint,
+            effective_processing_policy_fingerprint=policy_fingerprint,
         )
 
     pages_data: list[OCRPage] = []
@@ -1765,7 +2097,7 @@ def extract_internal_ocr_document(
         pass
 
     # Fail if any required page-cache write failed
-    if cache_failures and SETTINGS.ocr_result_cache_required:
+    if cache_failures and cache_writes_enabled and SETTINGS.ocr_result_cache_required:
         raise RuntimeError(
             f"Page cache write failed for pages {cache_failures} and cache is required"
         )
@@ -1786,8 +2118,9 @@ def extract_internal_ocr_document(
     response["processing"] = {
         "image_processing": {
             "enabled": enhance,
-            "profile": profile_name,
+            "profile": effective_profile,
             "pipeline_version": SETTINGS.ocr_image_processing_pipeline_version,
+            "requested_profile": requested_profile,
         },
         "cache": {"status": "bypassed" if cache_mode == "bypass" else "pending", "mode": cache_mode},
         "execution": {
@@ -1799,6 +2132,9 @@ def extract_internal_ocr_document(
     }
     if processing_meta:
         response["processing"]["image_processing"].update(processing_meta)
+    response["processing"]["quality_assessment"] = build_quality_assessment(
+        response, selected_pages=selected_pages
+    )
 
     # Write full-document cache only after all pages succeeded
     if cache_writes_enabled:
@@ -1821,7 +2157,7 @@ def extract_internal_ocr_document(
             processing={
                 "selected_pages": selected_pages,
                 "image_processing_enabled": enhance,
-                "image_processing_profile": profile_name,
+                "image_processing_profile": effective_profile,
             },
             response=response,
         )
@@ -1832,5 +2168,22 @@ def extract_internal_ocr_document(
             raise RuntimeError("OCR result cache write failed and cache is required")
         else:
             response["processing"]["cache"] = {"status": "unavailable"}
+
+    cache_outcome = "bypassed" if cache_mode == "bypass" else "refreshed" if cache_mode == "refresh" else "miss"
+    response["processing"]["ocr_run_manifest"] = _build_ocr_run_manifest(
+        response=response,
+        source_file_hash=file_hash,
+        selected_pages=selected_pages,
+        processing_profile=effective_profile,
+        requested_processing_profile=requested_profile,
+        cache_mode=cache_mode,
+        cache_outcome=cache_outcome,
+        request_id=request_id,
+        correlation_id=correlation_id,
+        pipeline_fingerprint=pipeline_fingerprint,
+        recovery_policy_fingerprint=recovery_policy_fingerprint,
+        rendering_fingerprint=rendering_fingerprint,
+        processing_policy_fingerprint=policy_fingerprint,
+    )
 
     return response

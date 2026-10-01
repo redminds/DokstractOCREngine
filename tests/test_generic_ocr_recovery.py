@@ -32,6 +32,29 @@ def test_sparse_low_resolution_page_triggers_generic_recovery():
     ) is True
 
 
+def test_low_resolution_page_with_visible_uncovered_band_triggers_recovery():
+    import numpy as np
+
+    image = np.full((1109, 857, 3), 255, dtype="uint8")
+    # Simulate a dense text band between two otherwise detected regions.
+    image[150:300, 30:820] = 180
+    page = OCRPage(
+        page_number=4,
+        width=857,
+        height=1109,
+        items=[
+            _item("top", "detected heading", 10, 100),
+            _item("bottom", "detected continuation", 10, 360),
+        ],
+    )
+    assert _should_attempt_recovery(
+        image,
+        page,
+        enhance=False,
+        rendering_profile="standard",
+    ) is True
+
+
 def test_dense_or_large_page_does_not_trigger_recovery():
     page = OCRPage(
         page_number=1,

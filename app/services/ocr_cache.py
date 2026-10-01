@@ -66,6 +66,7 @@ def compute_request_fingerprint(
     render_scale: float,
     recovery_policy_version: str = "1",
     rendering_config_fingerprint: str = "1",
+    effective_processing_policy_fingerprint: str = "legacy",
 ) -> str:
     """Build a deterministic cache key from all output-affecting inputs."""
     normalised_pages = ",".join(str(p) for p in sorted(set(selected_pages)))
@@ -80,6 +81,7 @@ def compute_request_fingerprint(
         str(round(render_scale, 2)),
         recovery_policy_version,
         rendering_config_fingerprint,
+        effective_processing_policy_fingerprint,
     ]
     raw = "|".join(components)
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -96,6 +98,7 @@ def compute_page_fingerprint(
     render_scale: float,
     recovery_policy_version: str = "1",
     rendering_config_fingerprint: str = "1",
+    effective_processing_policy_fingerprint: str = "legacy",
 ) -> str:
     """Build a deterministic cache key for a single page's output.
 
@@ -117,6 +120,7 @@ def compute_page_fingerprint(
         str(round(render_scale, 2)),
         recovery_policy_version,
         rendering_config_fingerprint,
+        effective_processing_policy_fingerprint,
     ]
     raw = "|".join(components)
     return hashlib.sha256(raw.encode()).hexdigest()
