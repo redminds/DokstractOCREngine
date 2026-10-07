@@ -15,6 +15,7 @@ from enum import Enum
 import numpy as np
 
 from app.core.config import SETTINGS
+from app.services.ocr.geometry import normalize_bbox
 
 logger = logging.getLogger("dokstract.ocr_engine.page_classifier")
 
@@ -293,21 +294,52 @@ def reconstruct_page_from_tiles(
         y_off = tile_data.get("tile_y_offset", 0)
         x_off = 0  # vertical tiling only
 
+        item_id_map = {
+            item.get("item_id", ""): f"p{page_number}_t{tile_idx}_{item.get('item_id', '')}"
+            for item in tile_data.get("items", [])
+        }
+        line_id_map = {
+            line.get("line_id", ""): f"p{page_number}_t{tile_idx}_{line.get('line_id', '')}"
+            for line in tile_data.get("lines", [])
+        }
+        block_id_map = {
+            block.get("block_id", ""): f"p{page_number}_t{tile_idx}_{block.get('block_id', '')}"
+            for block in tile_data.get("blocks", [])
+        }
+
         # Translate items
         for item in tile_data.get("items", []):
+            item = dict(item)
             bbox = item.get("bbox", {})
-            item["bbox"] = {
+            translated_bbox = {
                 "x1": bbox.get("x1", 0) + x_off,
                 "y1": bbox.get("y1", 0) + y_off,
                 "x2": bbox.get("x2", 0) + x_off,
                 "y2": bbox.get("y2", 0) + y_off,
             }
+            item["bbox"] = translated_bbox
+            polygon = item.get("polygon")
+            if isinstance(polygon, list):
+                item["polygon"] = [
+                    [float(point[0]) + x_off, float(point[1]) + y_off]
+                    for point in polygon
+                    if isinstance(point, (list, tuple)) and len(point) >= 2
+                ]
+            item["normalized_bbox"] = normalize_bbox(
+                _bbox_from_dict(translated_bbox), full_width, full_height,
+            ).to_list()
             item["page_number"] = page_number
-            item["item_id"] = f"p{page_number}_t{tile_idx}_{item.get('item_id', '')}"
+            original_item_id = item.get("item_id", "")
+            item["item_id"] = item_id_map.get(original_item_id, f"p{page_number}_t{tile_idx}_{original_item_id}")
+            if item.get("line_id"):
+                item["line_id"] = line_id_map.get(item["line_id"], item["line_id"])
+            if item.get("block_id"):
+                item["block_id"] = block_id_map.get(item["block_id"], item["block_id"])
             all_items.append(item)
 
         # Translate lines with dedup
         for line in tile_data.get("lines", []):
+            line = dict(line)
             lbbox = line.get("bbox", {})
             lx1 = lbbox.get("x1", 0) + x_off
             ly1 = lbbox.get("y1", 0) + y_off
@@ -322,12 +354,20 @@ def reconstruct_page_from_tiles(
             seen_line_sigs.add(sig)
 
             line["bbox"] = {"x1": lx1, "y1": ly1, "x2": lx2, "y2": ly2}
+            line["normalized_bbox"] = normalize_bbox(
+                _bbox_from_dict(line["bbox"]), full_width, full_height,
+            ).to_list()
             line["page_number"] = page_number
-            line["line_id"] = f"p{page_number}_t{tile_idx}_{line.get('line_id', '')}"
+            original_line_id = line.get("line_id", "")
+            line["line_id"] = line_id_map.get(original_line_id, f"p{page_number}_t{tile_idx}_{original_line_id}")
+            line["item_ids"] = [item_id_map.get(item_id, item_id) for item_id in line.get("item_ids", [])]
+            if line.get("block_id"):
+                line["block_id"] = block_id_map.get(line["block_id"], line["block_id"])
             all_lines.append(line)
 
         # Translate blocks
         for block in tile_data.get("blocks", []):
+            block = dict(block)
             bbox = block.get("bbox", {})
             block["bbox"] = {
                 "x1": bbox.get("x1", 0) + x_off,
@@ -336,7 +376,9 @@ def reconstruct_page_from_tiles(
                 "y2": bbox.get("y2", 0) + y_off,
             }
             block["page_number"] = page_number
-            block["block_id"] = f"p{page_number}_t{tile_idx}_{block.get('block_id', '')}"
+            original_block_id = block.get("block_id", "")
+            block["block_id"] = block_id_map.get(original_block_id, f"p{page_number}_t{tile_idx}_{original_block_id}")
+            block["line_ids"] = [line_id_map.get(line_id, line_id) for line_id in block.get("line_ids", [])]
             all_blocks.append(block)
 
     return {
@@ -349,3 +391,13 @@ def reconstruct_page_from_tiles(
         "tiled": True,
         "tile_count": len(tile_results),
     }
+
+
+def _bbox_from_dict(value: dict) -> "BBox":
+    """Build a geometry BBox without coupling tile reconstruction to models."""
+    from app.services.ocr.models import BBox
+
+    return BBox(
+        float(value.get("x1", 0.0)), float(value.get("y1", 0.0)),
+        float(value.get("x2", 0.0)), float(value.get("y2", 0.0)),
+    )
