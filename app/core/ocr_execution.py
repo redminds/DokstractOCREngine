@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -204,6 +205,10 @@ _OCR_ENGINE = None
 _OCR_RECOVERY_ENGINE = None
 _OCR_ENGINE_DIAGNOSTICS: dict[str, Any] = {}
 _OCR_FORCE_MKLDNN_DISABLED = False
+# PaddleOCR predictors are shared process-wide and are not safe for concurrent
+# inference calls. Request concurrency remains useful for queueing, rendering,
+# and response work, but the predictor itself must be serialized.
+_OCR_INFERENCE_LOCK = threading.RLock()
 
 
 def _is_mkldnn_runtime_error(exc: RuntimeError) -> bool:
@@ -211,12 +216,24 @@ def _is_mkldnn_runtime_error(exc: RuntimeError) -> bool:
     return "could not execute a primitive" in message or "mkldnn" in message or "onednn" in message
 
 
-def _reset_ocr_engines_without_mkldnn() -> None:
-    global _OCR_ENGINE, _OCR_RECOVERY_ENGINE, _OCR_ENGINE_DIAGNOSTICS, _OCR_FORCE_MKLDNN_DISABLED
-    _OCR_FORCE_MKLDNN_DISABLED = True
+def _is_recoverable_predictor_runtime_error(exc: RuntimeError) -> bool:
+    """Identify Paddle predictor state failures that are safe to recover from."""
+    message = str(exc).lower()
+    return "tensor holds no memory" in message or "preconditionnotmeterror" in message
+
+
+def _reset_ocr_engines() -> None:
+    global _OCR_ENGINE, _OCR_RECOVERY_ENGINE, _OCR_ENGINE_DIAGNOSTICS
     _OCR_ENGINE = None
     _OCR_RECOVERY_ENGINE = None
     _OCR_ENGINE_DIAGNOSTICS = {}
+    logger.warning("Resetting OCR engines after a recoverable predictor runtime failure")
+
+
+def _reset_ocr_engines_without_mkldnn() -> None:
+    global _OCR_ENGINE, _OCR_RECOVERY_ENGINE, _OCR_ENGINE_DIAGNOSTICS, _OCR_FORCE_MKLDNN_DISABLED
+    _OCR_FORCE_MKLDNN_DISABLED = True
+    _reset_ocr_engines()
     logger.warning("Resetting OCR engines with MKL-DNN disabled after an inference primitive failure")
 
 
@@ -387,14 +404,18 @@ def run_ocr(image: np.ndarray, enhance: bool) -> _RawOCRResult:
         image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
     image_height, image_width = image.shape[:2]
-    try:
-        result = _get_ocr_engine().ocr(image, cls=False)
-    except RuntimeError as exc:
-        if not _OCR_FORCE_MKLDNN_DISABLED and SETTINGS.ocr_enable_mkldnn and _is_mkldnn_runtime_error(exc):
-            _reset_ocr_engines_without_mkldnn()
+    with _OCR_INFERENCE_LOCK:
+        try:
             result = _get_ocr_engine().ocr(image, cls=False)
-        else:
-            raise
+        except RuntimeError as exc:
+            if _is_mkldnn_runtime_error(exc):
+                _reset_ocr_engines_without_mkldnn()
+                result = _get_ocr_engine().ocr(image, cls=False)
+            elif _is_recoverable_predictor_runtime_error(exc):
+                _reset_ocr_engines()
+                result = _get_ocr_engine().ocr(image, cls=False)
+            else:
+                raise
 
     return _RawOCRResult(
         raw_result=result,
@@ -406,14 +427,18 @@ def run_ocr(image: np.ndarray, enhance: bool) -> _RawOCRResult:
 def run_recovery_ocr(image: np.ndarray) -> _RawOCRResult:
     """Run the bounded generic recovery detector on the original page image."""
     image_height, image_width = image.shape[:2]
-    try:
-        result = _get_ocr_recovery_engine().ocr(image, cls=False)
-    except RuntimeError as exc:
-        if not _OCR_FORCE_MKLDNN_DISABLED and SETTINGS.ocr_enable_mkldnn and _is_mkldnn_runtime_error(exc):
-            _reset_ocr_engines_without_mkldnn()
+    with _OCR_INFERENCE_LOCK:
+        try:
             result = _get_ocr_recovery_engine().ocr(image, cls=False)
-        else:
-            raise
+        except RuntimeError as exc:
+            if _is_mkldnn_runtime_error(exc):
+                _reset_ocr_engines_without_mkldnn()
+                result = _get_ocr_recovery_engine().ocr(image, cls=False)
+            elif _is_recoverable_predictor_runtime_error(exc):
+                _reset_ocr_engines()
+                result = _get_ocr_recovery_engine().ocr(image, cls=False)
+            else:
+                raise
     return _RawOCRResult(
         raw_result=result,
         image_width=float(image_width),
@@ -1179,14 +1204,21 @@ def _build_tiled_page(
             "items": [{
                 "item_id": it.item_id, "text": it.text,
                 "confidence": it.confidence,
+                "polygon": it.polygon,
                 "bbox": {"x1": it.bbox.x1, "y1": it.bbox.y1,
                          "x2": it.bbox.x2, "y2": it.bbox.y2},
+                "normalized_bbox": it.normalized_bbox.to_list(),
+                "line_id": it.line_id,
+                "block_id": it.block_id,
             } for it in tile_page_data.items],
             "lines": [{
                 "line_id": ln.line_id, "text": ln.text,
                 "confidence": ln.confidence,
                 "bbox": {"x1": ln.bbox.x1, "y1": ln.bbox.y1,
                          "x2": ln.bbox.x2, "y2": ln.bbox.y2},
+                "normalized_bbox": ln.normalized_bbox.to_list() if ln.normalized_bbox else None,
+                "item_ids": list(ln.item_ids),
+                "block_id": ln.block_id,
             } for ln in tile_page_data.lines],
             "blocks": [],
             "tile_y_offset": y_offset,
@@ -1211,7 +1243,11 @@ def _build_tiled_page(
         items.append(OCRItem(
             item_id=it["item_id"], page_number=page, text=it["text"],
             confidence=it.get("confidence", 0.9),
+            polygon=it.get("polygon") or [],
             bbox=BBox(bb["x1"], bb["y1"], bb["x2"], bb["y2"]),
+            normalized_bbox=BBox(*it.get("normalized_bbox", [0.0, 0.0, 0.0, 0.0])),
+            line_id=it.get("line_id"),
+            block_id=it.get("block_id"),
         ))
     lines = []
     for ln in reconstructed["lines"]:
@@ -1220,6 +1256,9 @@ def _build_tiled_page(
             line_id=ln["line_id"], page_number=page, text=ln["text"],
             confidence=ln.get("confidence", 0.9),
             bbox=BBox(lb["x1"], lb["y1"], lb["x2"], lb["y2"]),
+            normalized_bbox=BBox(*ln["normalized_bbox"]) if ln.get("normalized_bbox") else None,
+            item_ids=list(ln.get("item_ids", [])),
+            block_id=ln.get("block_id"),
         ))
 
     page_data = OCRPage(

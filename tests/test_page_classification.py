@@ -133,6 +133,39 @@ class TestCoordinateReconstruction:
         assert result["items"][0]["bbox"]["y1"] == 520  # 20 + 500
         assert result["items"][0]["bbox"]["y2"] == 540  # 40 + 500
 
+    def test_item_polygon_and_relationship_ids_survive_translation(self):
+        tile_results = [{
+            "items": [{
+                "item_id": "i1", "text": "hello", "confidence": 0.95,
+                "polygon": [[10, 20], [100, 20], [100, 40], [10, 40]],
+                "bbox": {"x1": 10, "y1": 20, "x2": 100, "y2": 40},
+                "line_id": "l1", "block_id": "b1",
+            }],
+            "lines": [{
+                "line_id": "l1", "text": "hello", "confidence": 0.95,
+                "bbox": {"x1": 10, "y1": 20, "x2": 100, "y2": 40},
+                "item_ids": ["i1"], "block_id": "b1",
+            }],
+            "blocks": [{
+                "block_id": "b1", "bbox": {"x1": 10, "y1": 20, "x2": 100, "y2": 40},
+                "line_ids": ["l1"],
+            }],
+            "tile_y_offset": 500,
+        }]
+
+        result = reconstruct_page_from_tiles(tile_results, 1, 1000, 2000)
+        item = result["items"][0]
+        line = result["lines"][0]
+        block = result["blocks"][0]
+
+        assert item["polygon"] == [[10.0, 520.0], [100.0, 520.0], [100.0, 540.0], [10.0, 540.0]]
+        assert item["normalized_bbox"] == [0.01, 0.26, 0.1, 0.27]
+        assert item["line_id"] == line["line_id"]
+        assert item["block_id"] == block["block_id"]
+        assert line["item_ids"] == [item["item_id"]]
+        assert line["block_id"] == block["block_id"]
+        assert block["line_ids"] == [line["line_id"]]
+
     def test_line_ids_unique(self):
         tile_results = [
             {"items": [], "lines": [
