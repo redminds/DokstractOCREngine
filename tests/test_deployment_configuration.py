@@ -36,6 +36,9 @@ def test_compose_scopes_data_mount_and_shared_network():
     assert "ENGINE_CORS_ORIGINS=*" in env
     assert "OCR_ENGINE_ENABLE_SECONDARY_NETWORK=false" in env
     assert "OCR_ENGINE_SECONDARY_NETWORK=" in env
+    assert "OCR_ENABLE_MKLDNN=false" in env
+    assert "OCR_CPU_THREADS=1" in env
+    assert "OCR_TEXT_BATCH_SIZE=1" in env
     assert "ENGINE_REGISTRY_DB_PATH=/app/.data/ocr-engine-registry.db" in env
     assert "PLATFORM_MYSQL_VOLUME_NAME" not in env
     assert "ENGINE_HEALTH_WAIT_TIMEOUT_SECONDS" not in env

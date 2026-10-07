@@ -8,6 +8,8 @@ response_builder _debug key, geometry preservation.
 import pytest
 from unittest.mock import patch, MagicMock
 import numpy as np
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 
 # =============================================================================
@@ -47,6 +49,91 @@ class TestPdfRenderResult:
         r = PdfRenderResult(image=img, source_width_points=800, source_height_points=600,
                            source_rotation=90.0, effective_scale=2.0)
         assert r.source_rotation == 90.0
+
+
+class TestOCRInferenceSafety:
+    def test_shared_predictor_inference_is_serialized(self, monkeypatch):
+        from app.core import ocr_execution
+
+        active_calls = 0
+        max_active_calls = 0
+
+        class FakeEngine:
+            def ocr(self, image, cls=False):
+                nonlocal active_calls, max_active_calls
+                active_calls += 1
+                max_active_calls = max(max_active_calls, active_calls)
+                time.sleep(0.02)
+                active_calls -= 1
+                return None
+
+        monkeypatch.setattr(ocr_execution, "_OCR_ENGINE", FakeEngine())
+        image = np.zeros((20, 20, 3), dtype=np.uint8)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            list(executor.map(lambda _: ocr_execution.run_ocr(image, False), range(2)))
+
+        assert max_active_calls == 1
+
+    def test_predictor_tensor_failure_reinitializes_and_retries(self, monkeypatch):
+        from app.core import ocr_execution
+
+        class FlakyEngine:
+            def __init__(self):
+                self.calls = 0
+
+            def ocr(self, image, cls=False):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("PreconditionNotMetError: Tensor holds no memory")
+                return None
+
+        first_engine = FlakyEngine()
+        class StableEngine:
+            calls = 0
+
+            def ocr(self, image, cls=False):
+                self.calls += 1
+                return None
+
+        replacement_engine = StableEngine()
+        engines = iter((first_engine, replacement_engine))
+        monkeypatch.setattr(ocr_execution, "_OCR_ENGINE", None)
+        monkeypatch.setattr(ocr_execution, "_get_ocr_engine", lambda: next(engines))
+        image = np.zeros((20, 20, 3), dtype=np.uint8)
+
+        ocr_execution.run_ocr(image, False)
+
+        assert first_engine.calls == 1
+        assert replacement_engine.calls == 1
+
+    def test_primitive_failure_reinitializes_even_when_mkldnn_is_disabled(self, monkeypatch):
+        from app.core import ocr_execution
+
+        class FailingEngine:
+            calls = 0
+
+            def ocr(self, image, cls=False):
+                self.calls += 1
+                raise RuntimeError("RuntimeError: could not execute a primitive")
+
+        class StableEngine:
+            calls = 0
+
+            def ocr(self, image, cls=False):
+                self.calls += 1
+                return None
+
+        first_engine = FailingEngine()
+        replacement_engine = StableEngine()
+        engines = iter((first_engine, replacement_engine))
+        monkeypatch.setattr(ocr_execution, "_OCR_ENGINE", None)
+        monkeypatch.setattr(ocr_execution, "_get_ocr_engine", lambda: next(engines))
+        image = np.zeros((20, 20, 3), dtype=np.uint8)
+
+        ocr_execution.run_ocr(image, False)
+
+        assert first_engine.calls == 1
+        assert replacement_engine.calls == 1
 
 
 # =============================================================================
