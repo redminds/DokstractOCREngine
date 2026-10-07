@@ -1,6 +1,6 @@
 import json
 
-from app.core.ocr_execution import _build_ocr_run_manifest, _build_ocr_run_summary_for_outbox
+from app.core.ocr_execution import _build_ocr_run_manifest, _build_ocr_run_summary_for_outbox, _build_ocr_diagnostics_snapshot_for_outbox
 
 
 def _response(*, recovery=False, warning=False):
@@ -118,6 +118,37 @@ def test_outbox_summary_is_an_allow_listed_projection_of_terminal_manifest():
 
     assert_safe(summary)
     assert "source-secret" not in json.dumps(summary)
+
+
+def test_diagnostics_snapshot_projects_page_health_without_customer_content():
+    response = _response(recovery=True)
+    response["pages"][0].update({"width": 2480, "height": 3508, "rotation": 0, "text": "PRIVATE OCR TEXT"})
+    response["pages"][0]["metrics"]["render_dpi"] = 300
+    response["pages"][0]["metrics"]["geometry_diagnostics"] = {
+        "detected_region_count": 42,
+        "recognized_region_count": 38,
+        "mean_confidence": 0.7,
+        "text_coverage_ratio": 0.12,
+        "invalid_polygon_count": 1,
+        "warning_codes": ["GEOMETRY_WARNING"],
+        "quality_signals": ["GEOMETRY_WARNING"],
+    }
+    manifest = _build_ocr_run_manifest(
+        response=response, source_file_hash="document-hash", selected_pages=[7],
+        processing_profile="none", cache_mode="reuse", cache_outcome="hit",
+        request_id="request", correlation_id="correlation", pipeline_fingerprint="p",
+        recovery_policy_fingerprint="r", rendering_fingerprint="g",
+    )
+    snapshot = _build_ocr_diagnostics_snapshot_for_outbox(
+        response=response, manifest=manifest, execution_status="success", engine_release="release-1",
+    )
+    assert snapshot["health"] == "DEGRADED"
+    page = snapshot["page_diagnostics"][0]
+    assert page["render_width"] == 2480
+    assert page["geometry_warning_count"] == 1
+    assert page["recovery_result"] == "SUCCESS"
+    assert "PRIVATE OCR TEXT" not in json.dumps(snapshot)
+    assert "text" not in snapshot
 
 
 def test_outbox_summary_preserves_all_cache_modes_and_safe_outcomes():

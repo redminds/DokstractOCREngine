@@ -21,6 +21,30 @@ ocr_engine_request_duration_seconds = Histogram(
     ["caller_service"],
     buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0),
 )
+ocr_predictor_initializations_total = Counter(
+    "ocr_predictor_initializations_total",
+    "OCR predictor initializations by predictor kind.",
+    ["kind"],
+)
+ocr_predictor_reinitializations_total = Counter(
+    "ocr_predictor_reinitializations_total",
+    "OCR predictor recreations after runtime failures.",
+)
+ocr_predictor_recovery_total = Counter(
+    "ocr_predictor_recovery_total",
+    "OCR predictor recovery attempts by outcome.",
+    ["outcome"],
+)
+ocr_predictor_wait_seconds = Histogram(
+    "ocr_predictor_wait_seconds",
+    "Time spent waiting for serialized predictor inference.",
+    buckets=(0.0001, 0.001, 0.01, 0.1, 1.0, 5.0, 30.0),
+)
+ocr_geometry_warnings_total = Counter(
+    "ocr_geometry_warnings_total",
+    "Canonical OCR geometry warnings by warning code.",
+    ["code"],
+)
 ocr_execution_outbox_events = Gauge(
     "ocr_execution_outbox_events",
     "OCR execution outbox event counts by status.",
@@ -59,6 +83,27 @@ def record_ocr_execution_request(*, caller_service: str, status: str, page_count
     ocr_engine_requests_total.labels(caller_service=caller_service, status=status).inc()
     ocr_engine_pages_total.labels(caller_service=caller_service).inc(max(0, int(page_count)))
     ocr_engine_request_duration_seconds.labels(caller_service=caller_service).observe(max(0.0, float(duration_seconds)))
+
+
+def record_predictor_initialization(kind: str) -> None:
+    ocr_predictor_initializations_total.labels(kind=kind).inc()
+
+
+def record_predictor_reinitialization() -> None:
+    ocr_predictor_reinitializations_total.inc()
+
+
+def record_predictor_recovery(outcome: str) -> None:
+    ocr_predictor_recovery_total.labels(outcome=outcome).inc()
+
+
+def observe_predictor_wait(seconds: float) -> None:
+    ocr_predictor_wait_seconds.observe(max(0.0, float(seconds)))
+
+
+def record_geometry_warnings(codes: list[str] | set[str]) -> None:
+    for code in sorted(set(codes)):
+        ocr_geometry_warnings_total.labels(code=code).inc()
 
 
 def set_outbox_reporting_enabled(enabled: bool) -> None:

@@ -5,6 +5,8 @@ All functions are stateless and work with the internal BBox and OCRItem models.
 
 from __future__ import annotations
 
+import math
+
 from .models import BBox, OCRItem
 
 
@@ -109,3 +111,142 @@ def median_item_height(items: list[OCRItem]) -> float:
     if len(heights) % 2 == 0:
         return (heights[mid - 1] + heights[mid]) / 2.0
     return heights[mid]
+
+
+def _finite(value: object) -> bool:
+    return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def _polygon_area(polygon: list[list[float]]) -> float:
+    return abs(sum(
+        polygon[index][0] * polygon[(index + 1) % len(polygon)][1]
+        - polygon[(index + 1) % len(polygon)][0] * polygon[index][1]
+        for index in range(len(polygon))
+    )) / 2.0
+
+
+def _bbox_out_of_bounds(bbox: BBox, width: float, height: float, tolerance: float) -> bool:
+    return (
+        bbox.x1 < -tolerance or bbox.y1 < -tolerance
+        or bbox.x2 > width + tolerance or bbox.y2 > height + tolerance
+    )
+
+
+def validate_page_geometry(page: "OCRPage", tolerance: float = 1.0) -> dict[str, object]:
+    """Validate canonical page geometry without mutating or dropping evidence.
+
+    The result is intentionally diagnostic-only.  OCR consumers continue to
+    receive the original evidence even when a warning is found.
+    """
+    width = float(page.width or 0.0)
+    height = float(page.height or 0.0)
+    invalid_polygon_count = 0
+    out_of_bounds_polygon_count = 0
+    zero_area_polygon_count = 0
+    invalid_bbox_count = 0
+    out_of_bounds_bbox_count = 0
+    normalized_out_of_bounds_count = 0
+    relationship_broken_count = 0
+    item_ids = {item.item_id for item in page.items}
+    line_ids = {line.line_id for line in page.lines}
+    block_ids = {block.block_id for block in page.blocks}
+
+    for item in page.items:
+        polygon = item.polygon
+        valid_polygon = isinstance(polygon, list) and len(polygon) >= 3
+        if valid_polygon:
+            for point in polygon:
+                if not isinstance(point, (list, tuple)) or len(point) < 2 or not all(_finite(v) for v in point[:2]):
+                    valid_polygon = False
+                    break
+        if not valid_polygon:
+            invalid_polygon_count += 1
+        else:
+            polygon = [[float(point[0]), float(point[1])] for point in polygon]
+            if _polygon_area(polygon) <= 0.0:
+                zero_area_polygon_count += 1
+            if any(
+                x < -tolerance or y < -tolerance
+                or x > width + tolerance or y > height + tolerance
+                for x, y in polygon
+            ):
+                out_of_bounds_polygon_count += 1
+
+        bbox = item.bbox
+        if not all(_finite(value) for value in bbox.to_list()) or not bbox.is_valid:
+            invalid_bbox_count += 1
+        elif _bbox_out_of_bounds(bbox, width, height, tolerance):
+            out_of_bounds_bbox_count += 1
+
+        normalized = item.normalized_bbox
+        if normalized is None or any(
+            not _finite(value) or value < -0.001 or value > 1.001
+            for value in normalized.to_list()
+        ):
+            normalized_out_of_bounds_count += 1
+        if item.line_id and item.line_id not in line_ids:
+            relationship_broken_count += 1
+        if item.block_id and item.block_id not in block_ids:
+            relationship_broken_count += 1
+
+    for line in page.lines:
+        if any(item_id not in item_ids for item_id in line.item_ids):
+            relationship_broken_count += 1
+        if line.block_id and line.block_id not in block_ids:
+            relationship_broken_count += 1
+    for block in page.blocks:
+        if any(line_id not in line_ids for line_id in block.line_ids):
+            relationship_broken_count += 1
+
+    warnings: list[str] = []
+    if invalid_polygon_count or zero_area_polygon_count or invalid_bbox_count or normalized_out_of_bounds_count:
+        warnings.append("GEOMETRY_INVALID")
+    if out_of_bounds_polygon_count or out_of_bounds_bbox_count:
+        warnings.append("GEOMETRY_OUT_OF_BOUNDS")
+    if zero_area_polygon_count:
+        warnings.append("GEOMETRY_ZERO_AREA")
+    if relationship_broken_count:
+        warnings.append("GEOMETRY_RELATIONSHIP_BROKEN")
+
+    page_area = width * height
+    coverage = 0.0
+    if page_area > 0:
+        coverage = min(1.0, sum(item.bbox.width * item.bbox.height for item in page.items) / page_area)
+    y_edges = sorted({edge for item in page.items for edge in (item.bbox.y1, item.bbox.y2) if _finite(edge)})
+    largest_empty_vertical_region = 0.0
+    if height > 0 and y_edges:
+        largest_empty_vertical_region = max(
+            0.0,
+            max((right - left) for left, right in zip(y_edges, y_edges[1:])) / height,
+        )
+    confidences = [float(item.confidence) for item in page.items if _finite(item.confidence)]
+    mean_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+    low_confidence_count = sum(1 for value in confidences if value < 0.5)
+    quality_signals: list[str] = list(warnings)
+    if page.items and mean_confidence < 0.45:
+        quality_signals.append("LOW_CONFIDENCE")
+    if page.items and coverage < 0.003:
+        quality_signals.append("LOW_TEXT_COVERAGE")
+    if len(y_edges) >= 4 and largest_empty_vertical_region >= 0.35:
+        quality_signals.append("SUSPICIOUS_EMPTY_REGION")
+
+    return {
+        "version": 1,
+        "valid": not warnings,
+        "ocr_item_count": len(page.items),
+        "detected_region_count": len(page.items),
+        "recognized_region_count": sum(1 for item in page.items if item.text.strip()),
+        "mean_confidence": round(mean_confidence, 4),
+        "low_confidence_count": low_confidence_count,
+        "text_coverage_ratio": round(coverage, 6),
+        "largest_empty_vertical_region": round(largest_empty_vertical_region, 6),
+        "invalid_polygon_count": invalid_polygon_count,
+        "out_of_bounds_polygon_count": out_of_bounds_polygon_count,
+        "zero_area_polygon_count": zero_area_polygon_count,
+        "invalid_bbox_count": invalid_bbox_count,
+        "out_of_bounds_bbox_count": out_of_bounds_bbox_count,
+        "normalized_out_of_bounds_count": normalized_out_of_bounds_count,
+        "relationship_broken_count": relationship_broken_count,
+        "warning_codes": sorted(set(warnings)),
+        "quality_signals": sorted(set(quality_signals)),
+    }

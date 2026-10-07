@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.ocr.models import BBox, OCRItem
+from app.services.ocr.models import BBox, OCRItem, OCRLine, OCRPage
 from app.services.ocr.geometry import (
     polygon_to_bbox,
     normalize_bbox,
@@ -14,6 +14,7 @@ from app.services.ocr.geometry import (
     horizontal_distance,
     center_point,
     median_item_height,
+    validate_page_geometry,
 )
 
 
@@ -56,6 +57,43 @@ class TestPolygonToBBox:
         assert bbox.y1 == 73
         assert bbox.x2 == 42
         assert bbox.y2 == 73
+
+
+class TestGeometryDiagnostics:
+    def test_valid_page_has_no_geometry_warnings(self):
+        item = OCRItem(
+            item_id="p1_i0", page_number=1, text="hello", confidence=0.9,
+            polygon=[[10, 10], [50, 10], [50, 30], [10, 30]],
+            bbox=BBox(10, 10, 50, 30), normalized_bbox=BBox(0.1, 0.1, 0.5, 0.3),
+            line_id="p1_l0",
+        )
+        line = OCRLine(
+            line_id="p1_l0", page_number=1, text="hello", confidence=0.9,
+            bbox=BBox(10, 10, 50, 30), normalized_bbox=BBox(0.1, 0.1, 0.5, 0.3),
+            item_ids=["p1_i0"],
+        )
+        diagnostics = validate_page_geometry(OCRPage(
+            page_number=1, width=100, height=100, items=[item], lines=[line],
+        ))
+        assert diagnostics["valid"] is True
+        assert diagnostics["warning_codes"] == []
+        assert diagnostics["recognized_region_count"] == 1
+
+    def test_invalid_geometry_is_reported_without_dropping_item(self):
+        item = OCRItem(
+            item_id="p1_i0", page_number=1, text="hello", confidence=0.4,
+            polygon=[[0, 0], [10, 10], [20, 20]],
+            bbox=BBox(-2, 0, 20, 20), normalized_bbox=BBox(-0.1, 0, 0.2, 0.2),
+            line_id="missing-line",
+        )
+        page = OCRPage(page_number=1, width=100, height=100, items=[item])
+        diagnostics = validate_page_geometry(page)
+        assert diagnostics["ocr_item_count"] == 1
+        assert diagnostics["zero_area_polygon_count"] == 1
+        assert diagnostics["out_of_bounds_bbox_count"] == 1
+        assert diagnostics["relationship_broken_count"] == 1
+        assert "GEOMETRY_ZERO_AREA" in diagnostics["warning_codes"]
+        assert "LOW_CONFIDENCE" in diagnostics["quality_signals"]
 
 
 class TestNormalizeBBox:

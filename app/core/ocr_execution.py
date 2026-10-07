@@ -18,6 +18,13 @@ import fitz
 import numpy as np
 
 from app.core.config import SETTINGS
+from app.core.observability import (
+    observe_predictor_wait,
+    record_geometry_warnings,
+    record_predictor_initialization,
+    record_predictor_recovery,
+    record_predictor_reinitialization,
+)
 from app.services.image_processing import (
     ProcessingResult,
     apply_profile,
@@ -42,6 +49,8 @@ from app.services.ocr.reading_order import (
     assign_reading_order_blocks,
 )
 from app.services.ocr.response_builder import build_response
+from app.services.ocr.diagnostics import build_ocr_health_summary
+from app.services.ocr.geometry import validate_page_geometry
 from app.services.ocr.blank_detection import is_blank_page
 from app.services.ocr.low_content_detection import is_low_content_page
 from app.services.ocr.digital_pdf import extract_digital_page, _has_usable_digital_text
@@ -227,6 +236,7 @@ def _reset_ocr_engines() -> None:
     _OCR_ENGINE = None
     _OCR_RECOVERY_ENGINE = None
     _OCR_ENGINE_DIAGNOSTICS = {}
+    record_predictor_reinitialization()
     logger.warning("Resetting OCR engines after a recoverable predictor runtime failure")
 
 
@@ -265,6 +275,7 @@ def _get_ocr_engine():
 
         # Capture diagnostics
         _OCR_ENGINE_DIAGNOSTICS.update(_capture_paddle_diagnostics(_OCR_ENGINE))
+        record_predictor_initialization("baseline")
     return _OCR_ENGINE
 
 
@@ -293,6 +304,7 @@ def _get_ocr_recovery_engine():
         )
     except Exception as exc:  # pragma: no cover - environment-specific
         raise OCRDependencyUnavailable(f"OCR recovery engine unavailable: {exc}") from exc
+    record_predictor_initialization("recovery")
     return _OCR_RECOVERY_ENGINE
 
 
@@ -404,16 +416,28 @@ def run_ocr(image: np.ndarray, enhance: bool) -> _RawOCRResult:
         image = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
     image_height, image_width = image.shape[:2]
+    lock_wait_start = time.perf_counter()
     with _OCR_INFERENCE_LOCK:
+        observe_predictor_wait(time.perf_counter() - lock_wait_start)
         try:
             result = _get_ocr_engine().ocr(image, cls=False)
         except RuntimeError as exc:
             if _is_mkldnn_runtime_error(exc):
                 _reset_ocr_engines_without_mkldnn()
-                result = _get_ocr_engine().ocr(image, cls=False)
+                try:
+                    result = _get_ocr_engine().ocr(image, cls=False)
+                    record_predictor_recovery("success")
+                except RuntimeError:
+                    record_predictor_recovery("failure")
+                    raise
             elif _is_recoverable_predictor_runtime_error(exc):
                 _reset_ocr_engines()
-                result = _get_ocr_engine().ocr(image, cls=False)
+                try:
+                    result = _get_ocr_engine().ocr(image, cls=False)
+                    record_predictor_recovery("success")
+                except RuntimeError:
+                    record_predictor_recovery("failure")
+                    raise
             else:
                 raise
 
@@ -427,16 +451,28 @@ def run_ocr(image: np.ndarray, enhance: bool) -> _RawOCRResult:
 def run_recovery_ocr(image: np.ndarray) -> _RawOCRResult:
     """Run the bounded generic recovery detector on the original page image."""
     image_height, image_width = image.shape[:2]
+    lock_wait_start = time.perf_counter()
     with _OCR_INFERENCE_LOCK:
+        observe_predictor_wait(time.perf_counter() - lock_wait_start)
         try:
             result = _get_ocr_recovery_engine().ocr(image, cls=False)
         except RuntimeError as exc:
             if _is_mkldnn_runtime_error(exc):
                 _reset_ocr_engines_without_mkldnn()
-                result = _get_ocr_recovery_engine().ocr(image, cls=False)
+                try:
+                    result = _get_ocr_recovery_engine().ocr(image, cls=False)
+                    record_predictor_recovery("success")
+                except RuntimeError:
+                    record_predictor_recovery("failure")
+                    raise
             elif _is_recoverable_predictor_runtime_error(exc):
                 _reset_ocr_engines()
-                result = _get_ocr_recovery_engine().ocr(image, cls=False)
+                try:
+                    result = _get_ocr_recovery_engine().ocr(image, cls=False)
+                    record_predictor_recovery("success")
+                except RuntimeError:
+                    record_predictor_recovery("failure")
+                    raise
             else:
                 raise
     return _RawOCRResult(
@@ -1663,6 +1699,88 @@ def _build_ocr_run_summary_for_outbox(
     return summary
 
 
+def _build_ocr_diagnostics_snapshot_for_outbox(
+    *,
+    response: Any,
+    manifest: Any,
+    execution_status: str,
+    engine_release: Any,
+) -> dict[str, Any] | None:
+    """Project Level-0 technical diagnostics without changing the run summary."""
+    if not isinstance(response, dict) or not isinstance(manifest, dict):
+        return None
+    pages = response.get("pages") if isinstance(response.get("pages"), list) else []
+    page_diagnostics: list[dict[str, Any]] = []
+    warning_codes: set[str] = set()
+    recovery_used = False
+    failed_page = False
+    degraded_page = False
+    for page in pages[:500]:
+        if not isinstance(page, dict):
+            continue
+        metrics = page.get("metrics") if isinstance(page.get("metrics"), dict) else page.get("page_metrics") if isinstance(page.get("page_metrics"), dict) else {}
+        geometry = metrics.get("geometry_diagnostics") if isinstance(metrics.get("geometry_diagnostics"), dict) else {}
+        recovery = metrics.get("recovery") if isinstance(metrics.get("recovery"), dict) else {}
+        codes = sorted(set(str(code) for code in (geometry.get("warning_codes") or []) + (geometry.get("quality_signals") or []) if isinstance(code, str)))
+        warning_codes.update(codes)
+        attempted = bool(recovery.get("attempted"))
+        recovery_used = recovery_used or attempted
+        source = str(metrics.get("source") or "")
+        failed = source == "error"
+        degraded = bool(codes or attempted) and not failed
+        failed_page = failed_page or failed
+        degraded_page = degraded_page or degraded
+        confidences = sorted(float(item.get("confidence")) for item in (page.get("items") or []) if isinstance(item, dict) and isinstance(item.get("confidence"), (int, float)))
+        median_confidence = None
+        if confidences:
+            middle = len(confidences) // 2
+            median_confidence = confidences[middle] if len(confidences) % 2 else (confidences[middle - 1] + confidences[middle]) / 2
+        page_diagnostics.append({
+            "page_number": page.get("page_number"),
+            "render_width": page.get("width"),
+            "render_height": page.get("height"),
+            "orientation": page.get("rotation"),
+            "render_dpi": metrics.get("render_dpi"),
+            "detected_regions": geometry.get("detected_region_count"),
+            "recognized_regions": geometry.get("recognized_region_count"),
+            "ocr_item_count": len(page.get("items") or []),
+            "mean_confidence": geometry.get("mean_confidence", page.get("confidence")),
+            "median_confidence": round(median_confidence, 4) if median_confidence is not None else None,
+            "text_coverage_ratio": geometry.get("text_coverage_ratio"),
+            "geometry_warning_count": len(codes),
+            "invalid_polygon_count": geometry.get("invalid_polygon_count", 0),
+            "recovery_triggered": attempted,
+            "recovery_strategy": recovery.get("trigger"),
+            "recovery_result": "SUCCESS" if attempted and int(recovery.get("added_items") or 0) > 0 else "NO_CHANGE" if attempted else "NOT_NEEDED",
+            "predictor_recovery_count": int(metrics.get("predictor_reset_count") or 0),
+            "processing_duration_ms": metrics.get("page_total_ms"),
+            "page_health": "FAILED" if failed else "DEGRADED" if degraded else "HEALTHY",
+            "diagnostic_codes": codes,
+        })
+    quality = (response.get("processing") or {}).get("quality_assessment") if isinstance(response.get("processing"), dict) else {}
+    quality_outcome = quality.get("outcome") if isinstance(quality, dict) else None
+    health = "FAILED" if str(execution_status).lower() != "success" or failed_page else "DEGRADED" if quality_outcome == "needs_review" or degraded_page else "RECOVERED" if recovery_used else "HEALTHY_WITH_WARNINGS" if warning_codes else "HEALTHY"
+    execution = (manifest.get("engine_execution_id") or (response.get("processing") or {}).get("execution", {}).get("execution_id")) if isinstance(response.get("processing"), dict) else manifest.get("engine_execution_id")
+    return {
+        "schema_version": 1,
+        "privacy_level": 0,
+        "execution_id": execution,
+        "document_hash": manifest.get("source_file_hash"),
+        "engine_version": manifest.get("engine_ocr_version"),
+        "engine_release_tag": engine_release,
+        "pipeline_version": manifest.get("pipeline_fingerprint"),
+        "recovery_version": manifest.get("recovery_policy_fingerprint"),
+        "status": str(execution_status).lower(),
+        "health": health,
+        "page_count": len(page_diagnostics),
+        "selected_pages": manifest.get("selected_pages") if isinstance(manifest.get("selected_pages"), list) else [],
+        "warning_codes": sorted(warning_codes),
+        "recovery_used": recovery_used,
+        "predictor_recovery_count": sum(int(page.get("predictor_recovery_count") or 0) for page in page_diagnostics),
+        "page_diagnostics": page_diagnostics,
+    }
+
+
 def extract_internal_ocr_document(
     *,
     file_bytes: bytes,
@@ -1781,6 +1899,13 @@ def extract_internal_ocr_document(
             }
             response["processing"]["quality_assessment"] = build_quality_assessment(
                 response, selected_pages=selected_pages
+            )
+            response["processing"]["ocr_health"] = build_ocr_health_summary(
+                response,
+                execution_id=cached_execution.get("execution_id"),
+                engine_release=SETTINGS.default_release_tag,
+                pipeline_version=SETTINGS.ocr_image_processing_pipeline_version,
+                recovery_version=SETTINGS.ocr_recovery_policy_version,
             )
             response["processing"]["ocr_run_manifest"] = _build_ocr_run_manifest(
                 response=response,
@@ -2143,6 +2268,11 @@ def extract_internal_ocr_document(
 
     total_duration_ms = (time.perf_counter() - total_start) * 1000.0
 
+    for page in pages_data:
+        geometry_diagnostics = validate_page_geometry(page)
+        page.page_metrics["geometry_diagnostics"] = geometry_diagnostics
+        record_geometry_warnings(geometry_diagnostics.get("warning_codes", []))
+
     response = build_response(
         pages_data=pages_data, filename=filename, file_type=file_type,
         total_pages=page_count, selected_pages=selected_pages,
@@ -2173,6 +2303,13 @@ def extract_internal_ocr_document(
         response["processing"]["image_processing"].update(processing_meta)
     response["processing"]["quality_assessment"] = build_quality_assessment(
         response, selected_pages=selected_pages
+    )
+    response["processing"]["ocr_health"] = build_ocr_health_summary(
+        response,
+        execution_id=execution_id,
+        engine_release=SETTINGS.default_release_tag,
+        pipeline_version=SETTINGS.ocr_image_processing_pipeline_version,
+        recovery_version=SETTINGS.ocr_recovery_policy_version,
     )
 
     # Write full-document cache only after all pages succeeded

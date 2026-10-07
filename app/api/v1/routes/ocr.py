@@ -16,6 +16,7 @@ from app.core import ocr_execution
 from app.core.security import authenticate_service
 from app.core.service import OCREngineService
 from app.services.execution_outbox import OCREngineExecutionOutboxService
+from app.services.ocr.diagnostics import build_failure_bundle, document_fingerprint
 
 
 logger = logging.getLogger("dokstract.ocr_engine.routes")
@@ -196,6 +197,7 @@ async def extract_document(
     page_count = 0
     payload: dict[str, Any] | None = None
     execution_started = False
+    failure_bundle: dict[str, Any] | None = None
 
     try:
         async with _acquire_engine_request_slot():
@@ -225,11 +227,21 @@ async def extract_document(
                 ) from exc
             except RuntimeError as exc:
                 operation_status = "failed"
+                failure_bundle = build_failure_bundle(
+                    execution_id=x_request_id or uuid.uuid4().hex,
+                    document_hash=document_fingerprint(raw_bytes),
+                    engine_release=outcome.assigned_release.get("release_tag", SETTINGS.default_release_tag),
+                    pipeline_version=SETTINGS.ocr_image_processing_pipeline_version,
+                    recovery_version=SETTINGS.ocr_recovery_policy_version,
+                    failure_stage="ocr_execution",
+                    exc=exc,
+                )
                 logger.exception(
                     "OCR execution runtime failure: request_id=%s file=%s",
                     x_request_id,
                     file.filename or "uploaded-file",
                 )
+                logger.error("OCR sanitized diagnostic bundle: %s", failure_bundle)
                 error_code = "OCR_EXECUTION_FAILED"
                 error_message = "OCR engine execution failed."
                 raise HTTPException(
@@ -303,6 +315,8 @@ async def extract_document(
                     "supported_api_versions": release.get("supported_api_versions"),
                     "engine_capabilities": release.get("capabilities"),
                 }
+                if failure_bundle is not None:
+                    event_metadata["ocr_failure_bundle"] = failure_bundle
                 manifest = (payload.get("processing") or {}).get("ocr_run_manifest") if isinstance(payload, dict) else None
                 run_summary = ocr_execution._build_ocr_run_summary_for_outbox(
                     manifest=manifest,
@@ -312,6 +326,14 @@ async def extract_document(
                 )
                 if run_summary is not None:
                     event_metadata["ocr_run_summary"] = run_summary
+                diagnostics_snapshot = ocr_execution._build_ocr_diagnostics_snapshot_for_outbox(
+                    response=payload,
+                    manifest=manifest,
+                    execution_status=operation_status,
+                    engine_release=release.get("release_tag"),
+                )
+                if diagnostics_snapshot is not None:
+                    event_metadata["ocr_diagnostics_snapshot"] = diagnostics_snapshot
                 event_payload = {
                     "event_id": uuid.uuid4().hex,
                     "occurred_at": occurred_at,

@@ -19,6 +19,10 @@ QUALITY_REASON_CODES = {
     "targeted_fallback_applied",
     "blank_page_classified",
     "digital_pdf_fast_path",
+    "geometry_warning",
+    "low_confidence",
+    "low_text_coverage",
+    "suspicious_empty_region",
 }
 QUALITY_REASON_SEVERITIES = {"info", "warning", "error"}
 
@@ -31,6 +35,10 @@ _REASON_DEFINITIONS = {
     "targeted_fallback_applied": ("info", "A bounded quality-gated OCR fallback was accepted."),
     "blank_page_classified": ("info", "The page was classified as blank and OCR was skipped."),
     "digital_pdf_fast_path": ("info", "Embedded PDF text extraction was used."),
+    "geometry_warning": ("warning", "Canonical OCR geometry failed a generic integrity check."),
+    "low_confidence": ("warning", "The page produced a low aggregate OCR confidence signal."),
+    "low_text_coverage": ("warning", "OCR evidence covers an unusually small region of the page."),
+    "suspicious_empty_region": ("warning", "The page contains a large empty vertical region between OCR evidence."),
 }
 
 
@@ -89,6 +97,19 @@ def build_quality_assessment(
             else:
                 page_reasons.append("recovery_attempted_no_items")
                 reasons.append(_reason("recovery_attempted_no_items", [page_number] if page_number else []))
+        geometry = metrics.get("geometry_diagnostics") if isinstance(metrics.get("geometry_diagnostics"), dict) else {}
+        quality_signals = set(geometry.get("quality_signals", []))
+        if any(signal.startswith("GEOMETRY_") for signal in quality_signals):
+            page_reasons.append("geometry_warning")
+            reasons.append(_reason("geometry_warning", [page_number] if page_number else []))
+        for signal, reason_code in (
+            ("LOW_CONFIDENCE", "low_confidence"),
+            ("LOW_TEXT_COVERAGE", "low_text_coverage"),
+            ("SUSPICIOUS_EMPTY_REGION", "suspicious_empty_region"),
+        ):
+            if signal in quality_signals:
+                page_reasons.append(reason_code)
+                reasons.append(_reason(reason_code, [page_number] if page_number else []))
         if source == "blank":
             page_reasons.append("blank_page_classified")
             reasons.append(_reason("blank_page_classified", [page_number] if page_number else []))
