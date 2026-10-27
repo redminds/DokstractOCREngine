@@ -50,6 +50,11 @@ class EngineSettings:
     default_capabilities: tuple[str, ...] = _csv_env("ENGINE_DEFAULT_CAPABILITIES", "ocr,pdf")
     allow_origins: tuple[str, ...] = _csv_env("ENGINE_CORS_ORIGINS", "*")
     ocr_lang: str = os.getenv("OCR_LANG", "en").strip()
+    # Optional handwriting recognition is intentionally disabled until a
+    # separately evaluated adapter and labeled benchmark are accepted.
+    ocr_handwriting_enabled: bool = os.getenv("OCR_HANDWRITING_ENABLED", "false").strip().lower() == "true"
+    ocr_handwriting_recognizer: str = os.getenv("OCR_HANDWRITING_RECOGNIZER", "disabled").strip()
+    ocr_handwriting_model_path: str = os.getenv("OCR_HANDWRITING_MODEL_PATH", "").strip()
     ocr_cpu_threads: int = int(os.getenv("OCR_CPU_THREADS", "4"))
     ocr_enable_mkldnn: bool = os.getenv("OCR_ENABLE_MKLDNN", "false").strip().lower() == "true"
     ocr_det_limit_side_len: int = int(os.getenv("OCR_DET_LIMIT_SIDE_LEN", "1536"))

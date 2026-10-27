@@ -1,8 +1,11 @@
-FROM python:3.11-slim
+# syntax=docker/dockerfile:1.7
+
+FROM python:3.11.18-slim@sha256:38babcd68713a92a99060556871360468d492f0912342d2cd4244c17ca568709
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=5
 
 WORKDIR /app
 
@@ -19,7 +22,8 @@ RUN apt-get update \
 
 COPY requirements.lock.txt .
 
-RUN pip install --upgrade pip setuptools wheel \
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install --upgrade pip setuptools wheel \
     && pip install -r requirements.lock.txt
 
 COPY app ./app
