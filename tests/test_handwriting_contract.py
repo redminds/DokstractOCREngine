@@ -24,7 +24,7 @@ def test_handwriting_is_disabled_without_model_dependency():
 
 
 def test_enabled_handwriting_fails_closed_until_adapter_is_accepted():
-    with pytest.raises(RuntimeError, match="optional recognizer adapter"):
+    with pytest.raises(RuntimeError, match="model path"):
         get_handwriting_recognizer(enabled=True)
 
 
